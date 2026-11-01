@@ -1,4 +1,5 @@
 #!/usr/bin/env -S v
+
 // Smoke script: build the server, then pump a full MCP session through its
 // stdio pipes — the same bytes an agent would send.
 // Run: v run smoke.vsh

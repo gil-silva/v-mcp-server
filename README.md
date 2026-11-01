@@ -25,12 +25,15 @@ the real compiler output — the difference between "vibes-driven" and
 
 ## Requirements
 
-- [The V language](https://vlang.io), installed and on your `PATH`.
-  Check with:
+- [The V language](https://vlang.io), built from source on **current
+  `master`** and on your `PATH`. The `mcp` module this server is built on
+  is newer than the last stable release, so released versions (like
+  `0.5.2`) are not enough yet — they ship without `vlib/json2`, which this
+  project also uses. The V project's own recipe is two commands:
 
   ```bash
-  v version
-  # tested with v 0.5.2
+  git clone --depth 1 https://github.com/vlang/v && cd v && make
+  # then put the freshly built ./v on your PATH
   ```
 
 - A terminal. That's all — your agent starts the server itself when it

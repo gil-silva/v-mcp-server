@@ -58,7 +58,7 @@ fn run_v_tool(args []string) mcp.ToolResult {
 		}
 		return to_error_result(out)
 	}
-	if out.len == 0 {
+	if out == '' {
 		out = 'ok (exit 0, no output)'
 	}
 	return mcp.tool_text_result(truncate(out))

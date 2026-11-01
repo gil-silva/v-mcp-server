@@ -13,17 +13,33 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
+# No third-party action installs V anymore. Both "official shortcuts" proved
+# broken in 2026 for real projects: `vlang/setup-v@v1.4` exits success but
+# the compiler it sets up cannot find vlib (v-analyzer's CI — the reference
+# user — has been red for the same reason), and the official release zips
+# omit stdlib modules (0.5.2 ships without vlib/json2 at all, so even
+# `import json2` cannot compile). This project needs current master's stdlib
+# (the `mcp` and `json2` modules surfaced there more recently than 0.5.2),
+# so every job builds V from master with the plain `git clone + make`
+# recipe — exactly what vlang.io tells every developer to run.
+
 jobs:
   test:
-    name: v test . (stable V)
+    name: v test . (V master)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Install V (latest stable release)
-        uses: vlang/setup-v@v1.4
+      - name: Install V (source-built, current master)
+        run: |
+          git clone -q --depth 1 https://github.com/vlang/v /tmp/vsrc
+          make -C /tmp/vsrc || make -C /tmp/vsrc
+          echo /tmp/vsrc >> "$GITHUB_PATH"
 
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: v version (sanity)
+        run: v version
 
       - name: Build
         run: v -no-parallel -o bin/v-mcp-server .
@@ -37,36 +53,22 @@ jobs:
   lint:
     name: formatting + vet
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
-      - name: Install V
-        uses: vlang/setup-v@v1.4
+      - name: Install V (source-built, current master)
+        run: |
+          git clone -q --depth 1 https://github.com/vlang/v /tmp/vsrc
+          make -C /tmp/vsrc || make -C /tmp/vsrc
+          echo /tmp/vsrc >> "$GITHUB_PATH"
 
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: v version (sanity)
+        run: v version
 
       - name: v fmt -c (strict)
         run: v fmt -c .
 
       - name: v vet (informational)
         run: 'v vet . || echo "vet: found warnings (informational only)"'
-
-  # The anti-rot layer: every Monday morning, prove the project still builds
-  # against current V master. Failures here are an early warning, not an
-  # emergency (continue-on-error keeps the badge green).
-  weekly-master:
-    name: v test . (V master, weekly)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    if: github.event_name == 'schedule' || github.ref == 'refs/heads/master'
-    steps:
-      - name: Install V (master)
-        uses: vlang/setup-v@v1.4
-        with:
-          check-latest: true
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Run tests against V master
-        run: v test .
