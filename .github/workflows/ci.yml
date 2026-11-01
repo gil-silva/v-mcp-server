@@ -20,7 +20,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Install V (latest stable release)
-        id: install-v
         uses: vlang/setup-v@v1.4
 
       - name: Checkout
@@ -50,7 +49,7 @@ jobs:
         run: v fmt -c .
 
       - name: v vet (informational)
-        run: v vet . && echo "vet: no warnings"
+        run: 'v vet . || echo "vet: found warnings (informational only)"'
 
   # The anti-rot layer: every Monday morning, prove the project still builds
   # against current V master. Failures here are an early warning, not an
