@@ -1,7 +1,7 @@
 Module {
 	name: 'vmcpserver'
-	description: 'MCP server exposing V development tools (build, test, fmt, vet, ast, symbols, deps) to coding agents'
-	version: '0.1.0'
+	description: 'MCP server exposing V development tools (build, test, fmt, vet, ast, symbols, deps, repo briefs) to coding agents'
+	version: '0.2.0'
 	license: 'MIT'
-	dependencies: []
+	dependencies: ['https://github.com/gil-silva/vrepo']
 }

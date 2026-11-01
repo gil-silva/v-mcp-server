@@ -65,6 +65,34 @@ fn test_compile_and_handshake() {
 	assert names.contains('v_ast'), names.str()
 	assert names.contains('v_symbols'), names.str()
 	assert names.contains('v_deps'), names.str()
+	assert names.contains('v_repo_brief'), names.str()
+}
+
+fn test_v_repo_brief_call_round_trip() {
+	bin := compile_server()
+	defer {
+		os.rm(bin) or {}
+	}
+	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
+		panic('connect_stdio: ${err.msg()}')
+	}
+	defer {
+		client.close()
+	}
+	client.initialize()!
+
+	// brief this repository itself
+	res := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_repo_brief'
+			arguments: {
+				'path': json2.Any(@VMODROOT)
+			}
+		}) or { panic('tools/call: ${err.msg()}') }
+	assert !res.is_error, res.content
+	assert res.content.contains('vrepo brief — '), res.content
+	assert res.content.contains('module: vmcpserver 0.2.0 [MIT]'), res.content
+	assert res.content.contains('entry points: main.v'), res.content
 }
 
 struct Empty_tool_params {}

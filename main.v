@@ -12,10 +12,11 @@ import mcp
 import json2
 import os
 import time
+import gil_silva.vrepo.vrepo
 
 const server_name = 'v-mcp-server'
 
-const server_version = '0.1.0'
+const server_version = '0.2.0'
 
 // output_byte_limit caps any tool output, so agents never choke on
 // multi-megabyte AST dumps or test logs.
@@ -240,13 +241,25 @@ fn v_deps_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	return mcp.tool_text_result(fields.join('\n'))
 }
 
+// ---- v_repo_brief: a compact repo map via the vrepo library ------------------
+
+fn v_repo_brief_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[PathArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	out := vrepo.brief(a.path, vrepo.Budget{}) or {
+		return to_error_result('v_repo_brief: ${err.msg()}')
+	}
+	return mcp.tool_text_result(truncate(out))
+}
+
 // ---- server wiring ----------------------------------------------------------
 
 fn new_vlang_server() !mcp.Server {
 	mut server := mcp.new_server(
 		name:         server_name
 		version:      server_version
-		instructions: 'V development server: compile, test, format-check, vet, dump AST JSON, outline symbols, inspect v.mod. PASS ABSOLUTE PATHS.'
+		instructions: 'V development server: compile, test, format-check, vet, dump AST JSON, outline symbols, inspect v.mod, brief a repo. PASS ABSOLUTE PATHS.'
 	)
 	server.add_tool(mcp.Tool{
 		name:        'v_build'
@@ -276,6 +289,10 @@ fn new_vlang_server() !mcp.Server {
 		name:        'v_deps'
 		description: 'Read name/version/license/dependencies from the v.mod of a project (path).'
 	}, v_deps_tool)!
+	server.add_tool(mcp.Tool{
+		name:        'v_repo_brief'
+		description: 'Generate a compact token-efficient repo brief (module identity, entry points, file tree with LOC, per-file symbol outlines) of a V project directory (path). Deterministic; capped at ~40k chars.'
+	}, v_repo_brief_tool)!
 	return server
 }
 

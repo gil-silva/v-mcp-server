@@ -42,6 +42,7 @@ the real compiler output — the difference between "vibes-driven" and
 ## Build it once
 
 ```bash
+v install gil-silva.vrepo   # pulls the repo-brief library (vrepo) it now uses
 cd v-mcp-server
 v .          # builds the binary into bin/v-mcp-server
 ```
@@ -110,6 +111,9 @@ Open your agent in any V project and just ask normal things:
 > "Run the tests after this refactor."
 > → agent calls `v_test`
 
+> "Orient yourself in this repo first."
+> → agent calls `v_repo_brief`, gets a map instead of reading file-by-file
+
 ## Tools reference
 
 | Tool          | Arguments | What it does |
@@ -121,6 +125,7 @@ Open your agent in any V project and just ask normal things:
 | `v_ast`       | `{path}`  | `v ast -p` AST JSON (output capped at 100 kB) |
 | `v_symbols`   | `{path}`  | outline of fns/structs/interfaces/enums/consts/types + line numbers |
 | `v_deps`      | `{path}`  | name/version/license/dependencies from `v.mod` |
+| `v_repo_brief`| `{path}`  | compact repo map: module identity, entry points, tree with LOC, per-file symbol outlines (~40k char cap) |
 
 All tools expect **absolute** paths (e.g. `/home/you/vlang/vzed`), because
 the server doesn't know which folder your agent was opened in.
