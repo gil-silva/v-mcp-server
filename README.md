@@ -1,5 +1,7 @@
 # v-mcp-server
 
+[![CI](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml)
+
 Give your coding agent real V powers: compile errors, test runs, format
 checks, `v vet`, AST dumps, symbol outlines and `v.mod` inspection — through
 the [Model Context Protocol] (MCP).

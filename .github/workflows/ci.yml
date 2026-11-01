@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  schedule:
+    # Monday 06:00 UTC — the "does it still build against current V" ritual
+    - cron: '0 6 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: v test . (stable V)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install V (latest stable release)
+        id: install-v
+        uses: vlang/setup-v@v1.4
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: v -no-parallel -o bin/v-mcp-server .
+
+      - name: Run tests (includes the stdio client/server round trip)
+        run: v test .
+
+      - name: Smoke script
+        run: v run smoke.vsh
+
+  lint:
+    name: formatting + vet
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install V
+        uses: vlang/setup-v@v1.4
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: v fmt -c (strict)
+        run: v fmt -c .
+
+      - name: v vet (informational)
+        run: v vet . && echo "vet: no warnings"
+
+  # The anti-rot layer: every Monday morning, prove the project still builds
+  # against current V master. Failures here are an early warning, not an
+  # emergency (continue-on-error keeps the badge green).
+  weekly-master:
+    name: v test . (V master, weekly)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: github.event_name == 'schedule' || github.ref == 'refs/heads/master'
+    steps:
+      - name: Install V (master)
+        uses: vlang/setup-v@v1.4
+        with:
+          check-latest: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run tests against V master
+        run: v test .
