@@ -46,6 +46,17 @@ cd v-mcp-server
 v .          # builds the binary into bin/v-mcp-server
 ```
 
+## Or install from the V package registry
+
+Published on vpm as **`gil-silva.vmcpserver`** — instead of cloning:
+
+```bash
+v install gil-silva.vmcpserver
+cd ~/.vmodules/gil_silva/vmcpserver && v .
+```
+
+(Same program; `v install` just places the source under `~/.vmodules`.)
+
 ## Check it works (recommended)
 
 ```bash
