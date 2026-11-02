@@ -1,7 +1,5 @@
 <div align="center">
 
-<img src="assets/veasel.svg" width="290" alt="Veasel — the official V language mascot, a brown-and-cream weasel"/>
-
 # v-mcp-server
 
 **Give your coding agent real V powers.** Compile errors, program runs,
@@ -222,11 +220,10 @@ connect.
 - Built on the official [`vlib/mcp`](https://github.com/vlang/v) module
   (protocol revision `2025-11-25` by default; stdlib handles switching).
 - stdout is reserved for the protocol; all logs go to stderr.
-- The weasel up top is **Veasel**, the official V mascot by
+- The V mascot outside: **Veasel**, by
   [vlang/v-mascot](https://github.com/vlang/v-mascot)
-  (via `veasel.svg`; CC
-  [BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) — included
-  here with attribution, non-commercial use).
+  (CC [BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) — a
+  chibi variant may still join this README).
 - The two libraries it leans on, [`vrepo`](https://github.com/gil-silva/vrepo)
   (repo briefs) and
   [`vaffected`](https://github.com/gil-silva/vaffected) (affected-test
