@@ -1,10 +1,23 @@
+<div align="center">
+
+<img src="assets/veasel.svg" width="290" alt="Veasel — the official V language mascot, a brown-and-cream weasel"/>
+
 # v-mcp-server
 
-[![CI](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml)
+**Give your coding agent real V powers.** Compile errors, program runs,
+structured diagnostics, smart test selection, repo maps — over the
+[Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-Give your coding agent real V powers: compile errors, test runs, format
-checks, `v vet`, AST dumps, symbol outlines and `v.mod` inspection — through
-the [Model Context Protocol] (MCP).
+[![CI](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml)
+![version](https://img.shields.io/badge/version-0.3.0-4a6b9e)
+![vpm](https://img.shields.io/badge/vpm-gil--silva.vmcpserver-8a5f4a)
+![license](https://img.shields.io/badge/license-MIT-3a8a5f)
+
+*Vibes-driven coding is optional. Compiler-driven comes free.*
+
+</div>
+
+---
 
 ## What is this, in two sentences?
 
@@ -13,74 +26,81 @@ friends) safely call outside tools while they work. This program is an MCP
 "server": a small helper your agent starts in the background, which answers
 requests like *"what errors does the compiler give for this project?"*.
 
-Think of it as a USB port on your computer — only it plugs agents into the V
-toolchain instead of a mouse.
+Think of it as a USB port on your computer — only it plugs agents into the
+V toolchain instead of a mouse.
 
-## Why would I want it?
+## The loop it turns on
 
-Without it, an agent working in your repo has to guess what "wrong" looks
-like in V. With it, the agent can run `v_build` after every change and read
-the real compiler output — the difference between "vibes-driven" and
-"compiler-driven" AI coding.
+Before: an agent in your repo has to guess what "wrong" looks like in V —
+*vibes-driven* editing. After: every change closes a compiler-verified loop.
 
-## Requirements
-
-- [The V language](https://vlang.io), built from source on **current
-  `master`** and on your `PATH`. The `mcp` module this server is built on
-  is newer than the last stable release, so released versions (like
-  `0.5.2`) are not enough yet — they ship without `vlib/json2`, which this
-  project also uses. The V project's own recipe is two commands:
-
-  ```bash
-  git clone --depth 1 https://github.com/vlang/v && cd v && make
-  # then put the freshly built ./v on your PATH
-  ```
-
-- A terminal. That's all — your agent starts the server itself when it
-  connects; you never run it by hand if you don't want to.
-
-## Build it once
-
-```bash
-v install gil-silva.vrepo   # pulls the repo-brief library (vrepo) it now uses
-cd v-mcp-server
-v .          # builds the binary into bin/v-mcp-server
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent (your IDE)
+    participant S as v-mcp-server (stdio)
+    participant V as V toolchain
+    A->>S: v_errors { path }
+    S->>V: v -o tmp path
+    V-->>S: compiler diagnostics
+    S-->>A: JSON rows {file,line,col,kind,message}
+    Note over A: patches the file — at the right lines
+    A->>S: v_run { path, args }
+    S->>V: compile + execute
+    S-->>A: program output + exit code
+    A->>S: v_affected { path }
+    S-->>A: only the *_test.v files a change can affect
+    A->>S: v_test (narrowed)
+    S-->>A: green
 ```
 
-## Or install from the V package registry
+## Install & connect in three minutes
 
-Published on vpm as **`gil-silva.vmcpserver`** — instead of cloning:
+**1. Have V (from source, current `master`).** The `mcp` module this server
+builds on is newer than the last stable release, so released versions (like
+`0.5.2`) are not enough yet. The V project's own recipe is two commands:
+
+```bash
+git clone --depth 1 https://github.com/vlang/v && cd v && make
+# then put the freshly built ./v on your PATH
+```
+
+**2. Build the server once:**
+
+```bash
+v install gil-silva.vrepo gil-silva.vaffected
+cd v-mcp-server
+v .        # builds bin/v-mcp-server
+```
+
+<details>
+<summary><b>Or install from the V package registry (no clone)</b></summary>
+
+Published on vpm as <b><code>gil-silva.vmcpserver</code></b>:
 
 ```bash
 v install gil-silva.vmcpserver
 cd ~/.vmodules/gil_silva/vmcpserver && v .
 ```
 
-(Same program; `v install` just places the source under `~/.vmodules`.)
+Same program; `v install` just places the source under `~/.vmodules`.
+</details>
 
-## Check it works (recommended)
+**3. Connect your agent — once, one command, zero arguments:**
 
-```bash
-v test .     # builds the server and talks to it like an agent would
-v run smoke.vsh   # prints a full agent-style session; ends with ✓ smoke passed
-```
-
-Note: `v test .` takes under a minute (it compiles the whole project inside
-the test). All green = you're ready.
-
-## Connect your agent (once)
-
-**Claude Code** — run this in a terminal, then restart Claude Code:
+<details open>
+<summary><b>Claude Code</b></summary>
 
 ```bash
 claude mcp add vlang -- /home/<you>/vlang/v-mcp-server/bin/v-mcp-server
 ```
+</details>
 
-**OpenCode / Zed** — open their settings JSON and register the binary as a
-*stdio* MCP server:
+<details open>
+<summary><b>OpenCode</b></summary>
 
-```json
-// OpenCode (opencode.json)
+```jsonc
+// ~/.config/opencode/opencode.json
 {
   "mcp": {
     "vlang": {
@@ -90,29 +110,65 @@ claude mcp add vlang -- /home/<you>/vlang/v-mcp-server/bin/v-mcp-server
   }
 }
 ```
+</details>
 
-Zed's key is `context_servers`; either way, one command + zero arguments.
-(Exact JSON shapes change between releases — check your client's docs if it
-rejects the snippet.)
+<details>
+<summary><b>Zed</b></summary>
 
-## Use it (the fun part)
+Zed's settings key is `context_servers` — same one-liner shape as the JSON
+above, with the `command` array pointing at `bin/v-mcp-server`. (Exact JSON
+shapes drift between releases; check your client's docs if the snippet is
+rejected.)
+</details>
+
+Check it works (recommended):
+
+```bash
+v test .           # <1 min: builds the server, then talks to it like an agent
+v run smoke.vsh    # prints a full agent-style session; ends with ✓ smoke passed
+```
+
+That's it. A terminal is the only other requirement — your agent starts the
+server itself when it connects; you never run it by hand.
+
+## Ask your agent (the fun part)
 
 Open your agent in any V project and just ask normal things:
 
-> "Is everything formatted in src/?"
-> → agent calls `v_fmt_check`
+> *"Is everything formatted in src/?"*
+> → `v_fmt_check`
 
-> "This build is failing and I can't tell why."
-> → agent calls `v_build`, reads the diagnostics, fixes the file
+> *"This build is failing and I can't tell why."*
+> → `v_build`, reads the diagnostics, fixes the file
 
-> "What types and functions live in editor.v?"
-> → agent calls `v_symbols`, skips reading 2,000 lines
+> *"Show me the failing spots as data."*
+> → `v_errors` — JSON rows with exact `file/line/col`, no prose to decode
 
-> "Run the tests after this refactor."
-> → agent calls `v_test`
+> *"Run my program with these two seeds and show me what it prints."*
+> → `v_run` — one call: compile, execute, output
 
-> "Orient yourself in this repo first."
-> → agent calls `v_repo_brief`, gets a map instead of reading file-by-file
+> *"What types and functions live in editor.v?"*
+> → `v_symbols` — outline instead of reading 2,000 lines
+
+> *"Orient yourself in this repo first."*
+> → `v_repo_brief` — a map instead of file-by-file paging
+
+> *"Only re-run what this refactor can actually break."*
+> → `v_affected` — the moved-import graph decides test scope
+
+## Token & time economy — by construction
+
+No benchmark inflation here: these are structural guarantees (caps and
+one-call patterns), so the savings show up in your context every session.
+
+| Agent habit without it | With the server | Where the tokens go |
+|---|---|---|
+| page through files to orient | one `v_repo_brief` call, ≤ ~40k chars for a whole repo map | N file reads → 1 |
+| run the full test suite after every small change | `v_affected` lists only the tests the change can reach | suite size → changed-file size |
+| megabyte tool dumps pollute the conversation | every output hard-capped (100 kB) | bounded context, always |
+| fuzzy prose errors, re-read the whole file | `v_errors` JSON rows: `{file,line,col,kind,message}` | seek-style edits |
+| shell-out: compile, then run, disentangle streams | `v_run` one call; compile failure vs runtime exit kept distinct | 1 round trip |
+| a hung child wedges the whole tool queue | every spawned process capped at 600 s (SIGTERM → SIGKILL); calls keep flowing | never blocked |
 
 ## Tools reference
 
@@ -135,21 +191,44 @@ the server doesn't know which folder your agent was opened in.
 
 ## Troubleshooting
 
-- **"command not found" / agent can't connect** — check the path you
-  registered; it must point to `bin/v-mcp-server`, not the project folder.
-- **"no v.mod in ..." from `v_deps`** — you pointed it at a folder without
-  a `v.mod`, or a *file* instead of a folder.
-- **Tool outputs look truncated** — intentional cap (100 kB) so huge
-  outputs don't drown the conversation; ask for a more specific file.
-- **Rebuild after editing** — `v .` again; agents start the binary fresh on
-  each session, your changes take effect next session (or restart the
-  client).
+<details>
+<summary><b>"command not found" / agent can't connect</b></summary>
+Check the path you registered — it must point at
+<code>bin/v-mcp-server</code>, not the project folder.
+</details>
+
+<details>
+<summary><b>"no v.mod in ..." from <code>v_deps</code></b></summary>
+You pointed it at a folder without a <code>v.mod</code>, or a <i>file</i>
+instead of a folder.
+</details>
+
+<details>
+<summary><b>Tool outputs look truncated</b></summary>
+Intentional cap (100 kB) so huge outputs don't drown the conversation; ask
+for a more specific file.
+</details>
+
+<details>
+<summary><b>Server shows old tools after code changes</b></summary>
+Rebuild (`v -o bin/v-mcp-server -no-parallel .`) and force the client to
+re-spawn the binary — touch the config file or run <code>/mcps</code>.
+A failed spawn can leave the connection marked failed until a fresh
+connect.
+</details>
 
 ## Notes for the curious
 
 - Built on the official [`vlib/mcp`](https://github.com/vlang/v) module
   (protocol revision `2025-11-25` by default; stdlib handles switching).
 - stdout is reserved for the protocol; all logs go to stderr.
+- The weasel up top is **Veasel**, the official V mascot by
+  [vlang/v-mascot](https://github.com/vlang/v-mascot)
+  (via `veasel.svg`; CC
+  [BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) — included
+  here with attribution, non-commercial use).
+- The two libraries it leans on, [`vrepo`](https://github.com/gil-silva/vrepo)
+  (repo briefs) and
+  [`vaffected`](https://github.com/gil-silva/vaffected) (affected-test
+  graph), are published on vpm and usable without MCP.
 - License: MIT (see [LICENSE](LICENSE)).
-
-[Model Context Protocol]: https://modelcontextprotocol.io
