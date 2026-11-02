@@ -2,8 +2,9 @@
 
 # v-mcp-server
 
-**Give your coding agent real V powers.** Compile errors, program runs,
-structured diagnostics, smart test selection, repo maps — over the
+**Give your coding agent real V powers.** Compile errors, structured
+diagnostics, program runs, in-place formatting, smart test selection, repo
+maps, module docs — over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
 [![CI](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml)
@@ -51,6 +52,10 @@ sequenceDiagram
     S-->>A: only the *_test.v files a change can affect
     A->>S: v_test (narrowed)
     S-->>A: green
+    A->>S: v_fmt_check { path }
+    S-->>A: which files drift from v fmt
+    A->>S: v_fmt { path }
+    S-->>A: rewritten in place
 ```
 
 ## Install & connect in three minutes
@@ -122,12 +127,14 @@ rejected.)
 Check it works (recommended):
 
 ```bash
-v test .           # <1 min: builds the server, then talks to it like an agent
+v test .           # ≈1 min: builds the server, then talks to it like an agent
 v run smoke.vsh    # prints a full agent-style session; ends with ✓ smoke passed
 ```
 
 That's it. A terminal is the only other requirement — your agent starts the
-server itself when it connects; you never run it by hand.
+server itself when it connects; you never run it by hand. After connecting,
+ask *which server build are you running?* — `v_server_info` answers with the
+name, version and build timestamp baked into the binary.
 
 ## Ask your agent (the fun part)
 
@@ -139,14 +146,23 @@ Open your agent in any V project and just ask normal things:
 > *"This build is failing and I can't tell why."*
 > → `v_build`, reads the diagnostics, fixes the file
 
+> *"Build it with `-prod` and clang."*
+> → `vflags` on `v_build`/`v_run` — CLI flags passed through, no raw shell
+
 > *"Show me the failing spots as data."*
 > → `v_errors` — JSON rows with exact `file/line/col`, no prose to decode
 
 > *"Run my program with these two seeds and show me what it prints."*
-> → `v_run` — one call: compile, execute, output
+> → `v_run` — one call: compile, execute, labeled stdout/stderr
+
+> *"Format every file you touched."*
+> → `v_fmt` — closes the loop `v_fmt_check` opens (it only verifies)
 
 > *"What types and functions live in editor.v?"*
 > → `v_symbols` — outline instead of reading 2,000 lines
+
+> *"What does this module document?"*
+> → `v_doc` — the generated `v doc` output instead of paging raw source
 
 > *"Orient yourself in this repo first."*
 > → `v_repo_brief` — a map instead of file-by-file paging
@@ -154,9 +170,15 @@ Open your agent in any V project and just ask normal things:
 > *"Only re-run what this refactor can actually break."*
 > → `v_affected` — the moved-import graph decides test scope
 
+> *"Re-run just `test_parse_fn`."*
+> → `v_test` with `only:"*parse_fn*"` — a `VTEST_ONLY_FN` glob narrows the suite to one function
+
 > *"Who calls this function — and what implements this interface?"*
 > → `v_uses` — definitions, call sites with their enclosing fn, and
 > name-approximated implementers, with every section that has hits
+
+> *"Is the vlang server you're using current?"*
+> → `v_server_info` — version, build timestamp and `v -version`, no arguments
 
 ## Token & time economy — by construction
 
@@ -167,12 +189,14 @@ one-call patterns), so the savings show up in your context every session.
 |---|---|---|
 | page through files to orient | one `v_repo_brief` call, ≤ ~40k chars for a whole repo map | N file reads → 1 |
 | run the full test suite after every small change | `v_affected` lists only the tests the change can reach | suite size → changed-file size |
+| rerun the whole suite to chase one flaky test | `v_test {only:"*fn*"}` selects test functions (`VTEST_ONLY_FN`, via `env(1)`) | suite runtime → one function |
 | megabyte tool dumps pollute the conversation | every output hard-capped (100 kB) | bounded context, always |
 | fuzzy prose errors, re-read the whole file | `v_errors` JSON rows: `{file,line,col,kind,message}` | seek-style edits |
-| shell-out: compile, then run, disentangle streams | `v_run` one call; compile failure vs runtime exit kept distinct | 1 round trip |
+| shell-out: compile, then run, disentangle streams | `v_run` one call; compile failure vs runtime exit kept distinct, streams labeled | 1 round trip |
+| drop to the raw CLI for build flags (`-prod`, `-cc clang`) | `vflags` on `v_build`/`v_run`, passed verbatim to the v CLI | no shell detours |
 | a hung child wedges the whole tool queue | every spawned process capped at 600 s (SIGTERM → SIGKILL); calls keep flowing | never blocked |
 
-## Tools reference
+## Tools reference (15 tools)
 
 | Tool          | Arguments | What it does |
 |---------------|-----------|--------------|
@@ -193,7 +217,9 @@ one-call patterns), so the savings show up in your context every session.
 | `v_server_info` | — | the running build: name, version, compile-time build timestamp, and the underlying `v -version` — one call to spot a stale binary |
 
 All tools expect **absolute** paths (e.g. `/home/you/vlang/vzed`), because
-the server doesn't know which folder your agent was opened in.
+the server doesn't know which folder your agent was opened in — and every
+tool validates that up front, returning a clear error for relative or
+nonexistent paths instead of a cryptic compiler stream.
 
 ## Troubleshooting
 
