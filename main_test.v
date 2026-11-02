@@ -209,6 +209,22 @@ fn test_parse_diagnostics_skips_noise_and_dedupes() {
 	assert d[1].col == 6, 'col'
 }
 
+fn test_diagnostics_body_limit_shapes() {
+	diags := [
+		Diagnostic{ file: 'a.v', line: 1, col: 1, kind: 'error', message: 'm1' },
+		Diagnostic{ file: 'b.v', line: 2, col: 3, kind: 'warning', message: 'm2' },
+	]
+	// no cap (limit 0) or a cap at the exact count: the plain array, unchanged
+	assert diagnostics_body(diags, 0) == json2.encode(diags)
+	assert diagnostics_body(diags, 2) == json2.encode(diags)
+	// a cap below the count: rows + totals object, second row cut off
+	body := diagnostics_body(diags, 1)
+	assert body.contains('"rows":[{"file":"a.v"'), body
+	assert !body.contains('"b.v"'), body
+	assert body.contains('"total":2'), body
+	assert body.contains('"truncated":true'), body
+}
+
 fn test_v_run_and_v_errors_round_trips() {
 	bin := compile_server()
 	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
@@ -307,6 +323,230 @@ fn test_v_run_and_v_errors_round_trips() {
 	assert !res5.is_error, res5.content
 	// content is JSON-wrapped: the newlines arrive escaped inside the cell
 	assert res5.content.contains('program stdout:\\nping\\npong'), res5.content
+}
+
+fn test_v_errors_limit_round_trip() {
+	bin := compile_server()
+	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
+		panic('connect_stdio: ${err.msg()}')
+	}
+	defer {
+		client.close()
+	}
+	client.initialize()!
+
+	// a deliberately double-broken file: the uncapped call fixes the total
+	// (and warms the cache the capped call then hits)
+	broken := os.join_path(os.temp_dir(), 'v_errors_limit_${os.getpid()}.v')
+	os.write_file(broken, 'fn main() {\n\tthis does not compile\n\tnot even this\n}\n')!
+	defer {
+		os.rm(broken) or {}
+	}
+	res_all := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_errors'
+			arguments: {
+				'path': json2.Any(broken)
+			}
+		}) or { panic('tools/call v_errors: ${err.msg()}') }
+	assert !res_all.is_error, res_all.content
+	rows := json2.decode[[]Diagnostic](res_all.content) or {
+		panic('decode uncapped: ${err.msg()}: ${res_all.content}')
+	}
+	assert rows.len >= 1, res_all.content
+
+	res_cap := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_errors'
+			arguments: {
+				'path':  json2.Any(broken)
+				'limit': json2.Any(1)
+			}
+		}) or { panic('tools/call v_errors limit: ${err.msg()}') }
+	assert !res_cap.is_error, res_cap.content
+	if rows.len == 1 {
+		// exactly one diagnostic in total: the cap cannot trigger, the
+		// plain array shape survives
+		assert res_cap.content == res_all.content, res_cap.content
+		return
+	}
+	tr := json2.decode[TruncatedDiags](res_cap.content) or {
+		panic('decode capped: ${err.msg()}: ${res_cap.content}')
+	}
+	assert tr.truncated, res_cap.content
+	assert tr.rows.len == 1, res_cap.content
+	assert tr.total == rows.len, res_cap.content
+}
+
+fn test_strip_ansi_drops_color_codes() {
+	colored := '\x1b[36m@@ -1,2 +1,2 @@\x1b[0m\x1b[31m-fn main(){\x1b[0m\n\x1b[32m+fn main() {\x1b[0m\n'
+	assert strip_ansi(colored) == '@@ -1,2 +1,2 @@-fn main(){\n+fn main() {\n', strip_ansi(colored)
+	assert strip_ansi('plain text 123') == 'plain text 123'
+}
+
+fn test_v_fmt_check_diff_round_trip() {
+	bin := compile_server()
+	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
+		panic('connect_stdio: ${err.msg()}')
+	}
+	defer {
+		client.close()
+	}
+	client.initialize()!
+
+	// two unformatted files in a temp dir: the first check lists both files
+	// plus the diff hunks (ANSI-stripped); v_fmt fixes in place, and the
+	// second check turns drift-free and succeeds
+	dir := os.join_path(os.temp_dir(), 'v_fmt_diff_${os.getpid()}')
+	os.mkdir_all(dir)!
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	os.write_file(os.join_path(dir, 'a.v'), 'fn main(){\n\tmut x   =1\n\tprintln(x)\n}\n')!
+	os.write_file(os.join_path(dir, 'b.v'), 'fn other(){\n\tmut y   =2\n\tprintln(y)\n}\n')!
+
+	res := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_fmt_check'
+			arguments: {
+				'path': json2.Any(dir)
+				'diff': json2.Any(true)
+			}
+		}) or { panic('tools/call v_fmt_check diff: ${err.msg()}') }
+	assert res.is_error, res.content
+	// the file list names both files
+	assert res.content.contains('a.v'), res.content
+	assert res.content.contains('b.v'), res.content
+	// the hunks follow, with color codes gone
+	assert res.content.contains('diff:'), res.content
+	assert res.content.contains('-fn main(){'), res.content
+	assert res.content.contains('+fn main() {'), res.content
+	assert !res.content.contains('\x1b'), res.content
+
+	res_fix := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_fmt'
+			arguments: {
+				'path': json2.Any(dir)
+			}
+		}) or { panic('tools/call v_fmt: ${err.msg()}') }
+	assert !res_fix.is_error, res_fix.content
+
+	res_ok := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_fmt_check'
+			arguments: {
+				'path': json2.Any(dir)
+				'diff': json2.Any(true)
+			}
+		}) or { panic('tools/call v_fmt_check second: ${err.msg()}') }
+	assert !res_ok.is_error, res_ok.content
+	assert res_ok.content.contains('ok (exit 0, no output)'), res_ok.content
+}
+
+// gate_fixture_repo creates a one-file git repo for the v_gate E2E: a
+// committed unformatted test file (plus a fresh edit for the diff), all
+// state deterministic before the calls run.
+fn gate_fixture_repo() !string {
+	dir := os.join_path(os.temp_dir(), 'v_gate_fixture_${os.getpid()}')
+	os.mkdir_all(dir)!
+	os.write_file(os.join_path(dir, 'partzok_test.v'),
+		'module main\n\nfn test_ok() {\n\tassert true\n\ta   :=1\n}\n')!
+	steps := [
+		['git', 'init', '-q', dir],
+		['git', '-C', dir, 'config', 'user.email', 't@t'],
+		['git', '-C', dir, 'config', 'user.name', 't'],
+		['git', '-C', dir, 'add', '-A'],
+		['git', '-C', dir, 'commit', '-qm', 'fixture'],
+	]
+	for cmd in steps {
+		g := os.exec(cmd)
+		assert g.exit_code == 0, g.output
+	}
+	// the uncommitted edit: a second test fn, still unformatted — the
+	// static gate then sees fmt drift on it (no nested test runs here;
+	// the narrowed-run path stays covered by the parse/stats unit tests)
+	os.write_file(os.join_path(dir, 'partzok_test.v'),
+		'module main\n\nfn test_ok() {\n\tassert true\n\ta   :=1\n}\n\nfn test_bad() {\n\tassert false\n}\n')!
+	return dir
+}
+
+fn test_v_gate_fixture_round_trip() {
+	bin := compile_server()
+	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
+		panic('connect_stdio: ${err.msg()}')
+	}
+	defer {
+		client.close()
+	}
+	client.initialize()!
+	dir := gate_fixture_repo()!
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+
+	// the full gate (static sections only): fmt drift on the uncommitted edit
+	res := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_gate'
+			arguments: {
+				'path': json2.Any(dir)
+			}
+		}) or { panic('tools/call v_gate: ${err.msg()}') }
+	assert res.is_error, res.content
+	assert res.content.contains('\\"fmt_check\\":{\\"ok\\":false'), res.content
+	assert res.content.contains('\\"partzok_test.v\\"'), res.content
+	assert res.content.contains('\\"affected\\":[\\"partzok_test.v\\"'), res.content
+	assert res.content.contains('\\"tests_run\\":false'), res.content
+
+	// after formatting the fixture in place: the whole gate turns green
+	res_fmt := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_fmt'
+			arguments: {
+				'path': json2.Any(dir)
+			}
+		}) or { panic('tools/call v_fmt: ${err.msg()}') }
+	assert !res_fmt.is_error, res_fmt.content
+
+	res_green := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_gate'
+			arguments: {
+				'path': json2.Any(dir)
+			}
+		}) or { panic('tools/call v_gate green: ${err.msg()}') }
+	assert !res_green.is_error, res_green.content
+	assert res_green.content.contains('\\"ok\\":true'), res_green.content
+	assert res_green.content.contains('\\"fmt_check\\":{\\"ok\\":true'), res_green.content
+}
+
+fn test_v_gate_affected_requires_git() {
+	bin := compile_server()
+	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
+		panic('connect_stdio: ${err.msg()}')
+	}
+	defer {
+		client.close()
+	}
+	client.initialize()!
+
+	// a plain temp dir (no .git): the affected step cannot run — a gate
+	// failure, not a silent empty set
+	dir := os.join_path(os.temp_dir(), 'v_gate_nogit_${os.getpid()}')
+	os.mkdir_all(dir)!
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	res := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_gate'
+			arguments: {
+				'path': json2.Any(dir)
+			}
+		}) or { panic('tools/call v_gate nogit: ${err.msg()}') }
+	assert res.is_error, res.content
+	assert res.content.contains('v_gate: affected set:'), res.content
 }
 
 fn test_v_scratch_and_timeout_round_trips() {

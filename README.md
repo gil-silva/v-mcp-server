@@ -3,7 +3,8 @@
 # v-mcp-server
 
 **Give your coding agent real V powers.** Compile errors, structured
-diagnostics, program runs, in-place formatting, smart test selection, repo
+diagnostics, program runs, in-place formatting, smart test selection, a
+one-call commit gate, repo
 maps, symbol source reads, v.mod project lookup, module docs — over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
@@ -43,6 +44,11 @@ sequenceDiagram
     participant A as Agent (your IDE)
     participant S as v-mcp-server (stdio)
     participant V as V toolchain
+    A->>S: v_gate { path, run_tests: true }
+    S->>V: fmt check + vet + affected tests
+    S->>V: narrowed v -stats test (when run_tests)
+    S-->>A: one JSON verdict {fmt_check,vet,affected,tests,ok}
+    Note over A: commit decision in one round trip
     A->>S: v_errors { path }
     S->>V: v -o tmp path
     V-->>S: compiler diagnostics
@@ -51,12 +57,8 @@ sequenceDiagram
     A->>S: v_run { path, args }
     S->>V: compile + execute
     S-->>A: program output + exit code
-    A->>S: v_affected { path }
-    S-->>A: only the *_test.v files a change can affect
-    A->>S: v_test (narrowed)
-    S-->>A: green
-    A->>S: v_fmt_check { path }
-    S-->>A: which files drift from v fmt
+    A->>S: v_fmt_check { path, diff: true }
+    S-->>A: drifted files + the unified diff
     A->>S: v_fmt { path }
     S-->>A: rewritten in place
 ```
@@ -224,16 +226,17 @@ one-call patterns), so the savings show up in your context every session.
 | read a whole file to see one function | `v_read` returns just that symbol's source, with its line range | N file reads → 1 |
 | dig through raw test text for the failures | `v_test` `stats:true` rows `[{file,name,ok,ms,asserts}]`, detail trailing | prose → data |
 
-## Tools reference (18 tools)
+## Tools reference (19 tools)
 
 | Tool          | Arguments | What it does |
 |---------------|-----------|--------------|
 | `v_build`     | `{path, vflags?}` | compiles and returns compiler diagnostics; optional `vflags` (JSON array of strings) is forwarded verbatim to the V CLI (e.g. `-g`, `-prod`, `-cc clang`, `-d flag`); warm-cached for identical inputs |
-| `v_run`       | `{path, args?, stdin?, timeout?, vflags?}` | compiles `path`, executes the binary (or the cached one); optional `args` (JSON array of strings) become the program's argv, optional `stdin` (string) is piped to the program verbatim (no trailing newline added, EOF afterwards), optional `timeout` (integer seconds, 1..1800, default 600) raises each step's cap, optional `vflags` are forwarded to the compiler, output returned with stdout/stderr labeled |
+| `v_run`       | `{path, args?, stdin?, timeout?, vflags?}` | compiles `path`, executes the binary (or the cached one); optional `args` (JSON array of strings) become the program's argv, optional `stdin` (string) is piped to the program verbatim (no trailing newline added, EOF afterwards); with no `stdin`, a stdin-reading program sees EOF immediately, optional `timeout` (integer seconds, 1..1800, default 600) raises each step's cap, optional `vflags` are forwarded to the compiler, output returned with stdout/stderr labeled |
 | `v_scratch`   | `{code, stdin?, vflags?}` | compiles and runs a standalone snippet, no project scaffolding — `code` is the complete source, a program with `fn main` or plain top-level statements (V script mode); optional `stdin` piped verbatim (no trailing newline, EOF afterwards), optional `vflags` to the compiler; identical snippets replay the warm cache; failure contract identical to `v_run` |
-| `v_errors`    | `{path, vflags?, timeout?}`  | compile-only; diagnostics as JSON `[{file,line,col,kind,message}]` — `[]` means clean; optional `vflags` mirror the `v_build` command; optional `timeout` (integer seconds, 1..1800, default 600) raises the compile cap |
+| `v_errors`    | `{path, vflags?, limit?, timeout?}`  | compile-only; diagnostics as JSON `[{file,line,col,kind,message}]` — `[]` means clean; optional `vflags` mirror the `v_build` command; optional `limit` (integer ≥ 1) caps the rows at the first N — when longer lists exist the reply is an object `{rows,total,truncated:true}` instead of the array; optional `timeout` (integer seconds, 1..1800, default 600) raises the compile cap |
 | `v_test`      | `{path, only?, files?, stats?, timeout?}` | runs `v test`; optional `only` is a test-function glob forwarded as `VTEST_ONLY_FN` (via `env(1)`); optional `files` is a test-file filter forwarded as `VTEST_ONLY` — comma-separated patterns matched as substrings of each test file's path relative to `path`, pairing with the `v_affected` output; optional `stats` returns structured rows `[{file,name,ok,ms,asserts}]` with the raw output trailing as failure detail; optional `timeout` (integer seconds, 1..1800, default 600) raises the whole-run cap |
-| `v_fmt_check` | `{path}`  | `v fmt -c` — check only, never touches files |
+| `v_gate`      | `{path, base?, run_tests?}` | the one-call commit gate: `v fmt -c` (drift names the files), `v vet` (findings Surface as detail; only non-zero exits block), the affected `*_test.v` subset (git diff vs `HEAD`, or `base`), and — under `run_tests:true` — the affected tests executed as a narrowed `v -stats test` run. One JSON reply `{fmt_check,vet,affected,tests_run,tests,ok}`; the tool is an error result while `ok=false` |
+| `v_fmt_check` | `{path, diff?}`  | `v fmt -c` — check only, never touches files; optional `diff` (boolean) appends the unified diff of what `v fmt` would change (ANSI-stripped), error result while drift exists |
 | `v_fmt`       | `{path}`  | `v fmt -w` — format in place (mutates files) |
 | `v_vet`       | `{path}`  | `v vet` warnings |
 | `v_ast`       | `{path}`  | `v ast -p` AST JSON (output capped at 100 kB) |

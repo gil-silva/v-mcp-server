@@ -63,9 +63,10 @@ const v_scratch_schema = '{"type":"object","properties":{"code":{"description":"
 const v_build_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V file or project directory","type":"string"},"vflags":{"description":"Extra flags passed verbatim to the v CLI (optional, JSON array of strings, e.g. [\\"-prod\\"] or [\\"-cc\\",\\"clang\\"])","type":"array","items":{"type":"string"}}},"required":["path"],"additionalProperties":false}'
 
 // v_errors_schema mirrors v_build_schema and adds the optional per-call
-// `timeout` cap for the compile step; v_build (same payload shape, no
-// override accepted) keeps declaring only path/vflags.
-const v_errors_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V file or project directory","type":"string"},"vflags":{"description":"Extra flags passed verbatim to the v CLI (optional, JSON array of strings, e.g. [\\"-prod\\"] or [\\"-cc\\",\\"clang\\"])","type":"array","items":{"type":"string"}},"timeout":{"description":"Per-call timeout cap in seconds, 1..1800 (optional integer, default 600): the compile step is killed when it exceeds it","type":"integer"}},"required":["path"],"additionalProperties":false}'
+// `timeout` cap for the compile step plus `limit`, a row cap on the JSON
+// reply; v_build (same payload shape, no override accepted) keeps declaring
+// only path/vflags.
+const v_errors_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V file or project directory","type":"string"},"vflags":{"description":"Extra flags passed verbatim to the v CLI (optional, JSON array of strings, e.g. [\\"-prod\\"] or [\\"-cc\\",\\"clang\\"])","type":"array","items":{"type":"string"}},"timeout":{"description":"Per-call timeout cap in seconds, 1..1800 (optional integer, default 600): the compile step is killed when it exceeds it","type":"integer"},"limit":{"description":"Cap the diagnostics at the first N rows (optional integer, ≥ 1). When longer lists exist the reply is an object {rows,total,truncated:true} instead of the plain row array","type":"integer"}},"required":["path"],"additionalProperties":false}'
 
 // server_info_schema backs the no-argument v_server_info tool. It is the one
 // tool that intentionally declares nothing; smoke.vsh excludes it when
@@ -94,10 +95,36 @@ const v_read_schema = '{"type":"object","properties":{"path":{"description":"Abs
 // `"properties":{"path":{` occurrences server-wide.
 const v_where_schema = '{"type":"object","properties":{"path":{"description":"Absolute directory to scan for V projects (folders containing a v.mod); scanned a few levels deep","type":"string"}},"required":["path"],"additionalProperties":false}'
 
+// fmt_check_schema backs v_fmt_check alone (the other path-only tools share
+// path_args_schema): the optional `diff` switch returns what `v fmt` would
+// change alongside the file list. Same `path`-first rule.
+const fmt_check_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a single .v source file or a directory","type":"string"},"diff":{"description":"Also return the unified diff of what v fmt would change (optional boolean): the reply carries the unformatted file list and the diff, and stays an error result while drift exists","type":"boolean"}},"required":["path"],"additionalProperties":false}'
+
 // PathArgs is the common `arguments` payload of the tools below:
 // a path to a single .v file or a project directory.
 struct PathArgs {
 	path string
+}
+
+// FmtCheckArgs is the payload of v_fmt_check: a path to verify formatting
+// on, plus the optional diff switch that returns what `v fmt` would change.
+struct FmtCheckArgs {
+	path string
+	diff ?bool
+}
+
+// v_gate_schema backs the one-call commit gate — path required; base (the
+// git rev the affected set diffs against) and run_tests (execute the
+// narrowed suite) optional. Same `path`-first rule.
+const v_gate_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V project directory (a git repository, since the affected-set step runs git diff)","type":"string"},"base":{"description":"Git rev to diff against for the affected test subset (optional string, default HEAD)","type":"string"},"run_tests":{"description":"Execute the affected test files in the same call (optional boolean): the report gains parsed test rows among the sections, and any executed test failure fails the whole gate","type":"boolean"}},"required":["path"],"additionalProperties":false}'
+
+// GateArgs is the payload of v_gate: the project path, the optional git base
+// the affected-set diff runs against (default HEAD), and the optional
+// run_tests switch that executes the affected suite in the same call.
+struct GateArgs {
+	path      string
+	base      ?string
+	run_tests ?bool
 }
 
 // TestArgs is the payload of v_test: a path, an optional VTEST_ONLY_FN glob
@@ -114,11 +141,13 @@ struct TestArgs {
 
 // BuildArgs is the payload of v_build and v_errors: a path plus optional CLI
 // flags forwarded verbatim to the v compiler, and (v_errors only) an
-// optional per-call timeout cap for the compile step.
+// optional per-call timeout cap for the compile step and cap (limit) on the
+// count of JSON diagnostic rows.
 struct BuildArgs {
 	path    string
 	vflags  ?[]string
 	timeout ?int
+	limit   ?int
 }
 
 // RunArgs is the payload of v_run: path plus optional positional arguments
@@ -152,6 +181,16 @@ pub:
 	col     int
 	kind    string
 	message string
+}
+
+// TruncatedDiags is the over-limit v_errors reply: the first rows
+// diagnostics plus the real total, so the agent sees both the cap and the
+// full count in one reply.
+struct TruncatedDiags {
+pub:
+	rows      []Diagnostic
+	total     int
+	truncated bool
 }
 
 // AffectedArgs is the payload of v_affected: path plus the optional git rev
@@ -278,8 +317,20 @@ struct Capture {
 // v_affected's git probe, v_server_info and the toolchain stamp — each
 // formats the Capture its own way.
 fn run_capture(args []string, seconds int) Capture {
-	mut p := os.new_process(args[0])
-	p.set_args(args[1..])
+	// Every child rides through sh(1) with exec: "$@" keeps every argument
+	// byte-verbatim (nothing user-supplied is parsed by the shell), and
+	// `< /dev/null` gives the child an empty stdin instead of redirect-stdio's
+	// never-written, never-closed pipe — on which children that read stdin
+	// (vfmt on an input dir with no .v files, a v_run program reading its
+	// stdin with none piped) block until the timeout cap kills them.
+	mut cmd := []string{cap: args.len + 4}
+	cmd << 'sh'
+	cmd << '-c'
+	cmd << 'exec "$@" < /dev/null'
+	cmd << 'v-mcp-server-capture'
+	cmd << args
+	mut p := os.new_process(cmd[0])
+	p.set_args(cmd[1..])
 	p.set_redirect_stdio()
 	p.run()
 	defer {
@@ -819,6 +870,11 @@ fn v_errors_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	seconds := resolve_timeout(a.timeout) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
+	if l := a.limit {
+		if l < 1 {
+			return to_error_result('bad arguments: limit must be an integer ≥ 1 (or omit it)')
+		}
+	}
 	outcome := build_with_cache(a.path, flags, seconds)
 	diags := parse_diagnostics(outcome.text)
 	if diags.len == 0 && !outcome.ok {
@@ -827,8 +883,22 @@ fn v_errors_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 		// failed compile) explains, the captured text follows
 		return to_error_result('v_errors: ${outcome.summary}:\n${truncate(outcome.text)}')
 	}
-	body := json2.encode(diags)
-	return mcp.tool_text_result(truncate(body))
+	return mcp.tool_text_result(truncate(diagnostics_body(diags, a.limit or { 0 })))
+}
+
+// diagnostics_body renders the v_errors reply: the plain JSON row array —
+// the shape `[]` means clean — or, when a positive limit cuts a longer row
+// list short, an object {rows,total,truncated:true} so the agent sees both
+// the cap and the full count. limit < 1 keeps the plain array (no cap).
+fn diagnostics_body(diags []Diagnostic, limit int) string {
+	if limit < 1 || diags.len <= limit {
+		return json2.encode(diags)
+	}
+	return json2.encode(TruncatedDiags{
+		rows:      diags[..limit]
+		total:     diags.len
+		truncated: true
+	})
 }
 
 // parse_diagnostics extracts one-line compiler diagnostics from `v` output —
@@ -893,6 +963,30 @@ pub:
 	ok      bool
 	ms      f64
 	asserts int
+}
+
+// GateSection is one v_gate check verdict: the ok flag plus the detail text
+// (drifted file list, vet warnings, raw test output) and — for tests — the
+// parsed rows.
+struct GateSection {
+pub:
+	ok     bool
+	rows   []TestRow
+	detail string
+}
+
+// GateReport is the composite v_gate reply: the two static checks, the
+// affected test subset, the executed-tests section (exercises nothing when
+// tests_run is false), and the overall verdict — the tool is an error
+// result while ok=false.
+struct GateReport {
+pub:
+	fmt_check GateSection
+	vet       GateSection
+	affected  []string
+	tests_run bool
+	tests     GateSection
+	ok        bool
 }
 
 // parse_test_rows extracts one row per test result from `v -stats test`
@@ -1047,15 +1141,162 @@ fn v_test_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	return mcp.tool_text_result(truncate(test_report(rows, text)))
 }
 
-fn v_fmt_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
-	a := decode_args[PathArgs](arguments) or {
+// ---- v_gate: the one-call commit gate ---------------------------------------
+
+// v_gate_tool composes the whole pre-commit loop in one call: `v fmt -c`
+// (drift names the files), `v vet` (warnings informational — they surface as
+// detail, and only non-zero exits fail the gate), the affected test subset
+// (git diff + import graph), and — under run_tests — the narrowed `-stats`
+// test run with the affected files as the VTEST_ONLY filter. The reply is
+// one JSON report of sections; the tool itself is an error result while the
+// verdict ok=false.
+fn v_gate_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[GateArgs](arguments) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
 	validate_path(a.path) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
-	// `v fmt -c` checks formatting without touching files (exit 1 if unformatted).
-	return run_v_tool(['v', 'fmt', '-c', a.path], tool_timeout_seconds)
+
+	// formatting: exit non-zero when anything drifts; the merged streams
+	// name the files, silence with exit 0 is clean
+	c := run_capture(['v', 'fmt', '-c', a.path], tool_timeout_seconds)
+	fmt_ok := c.exit_code == 0 && !c.timed_out
+	mut fmt_detail := merge_streams(c.stdout, c.stderr).trim_space()
+	if fmt_detail == '' && !fmt_ok {
+		fmt_detail = 'v fmt -c exited with code ${c.exit_code} (no output)'
+	}
+
+	// vet: warnings do not fail the gate (they arrive as detail text);
+	// non-zero exit or a killed process does
+	vc := run_capture(['v', 'vet', a.path], tool_timeout_seconds)
+	vet_ok := vc.exit_code == 0 && !vc.timed_out
+	vet_detail := merge_streams(vc.stdout, vc.stderr).trim_space()
+
+	// the affected subset — undeterminable is a gate failure
+	affected_files := affected_test_files(a.path, a.base or { '' }) or {
+		return to_error_result('v_gate: affected set: ${err.msg()}')
+	}
+
+	// the optional narrowed test run: VTEST_ONLY carries the affected files
+	run := a.run_tests or { false }
+	mut tests_section := GateSection{ ok: true, detail: '' }
+	if run {
+		if affected_files.len == 0 {
+			tests_section = GateSection{ ok: true, detail: 'not run: nothing affected' }
+		} else {
+			files := affected_files.join(',')
+			validate_filter(files) or {
+				return to_error_result('v_gate: affected files filter: ${err.msg()}')
+			}
+			filters := env_test_filter_prefix('', files)
+			mut cmd := []string{}
+			cmd << 'env'
+			cmd << filters
+			cmd << 'v'
+			cmd << '-stats'
+			cmd << '-no-parallel'
+			cmd << 'test'
+			cmd << a.path
+			tc := run_capture(cmd, tool_timeout_seconds)
+			text := merge_streams(tc.stdout, tc.stderr)
+			rows := parse_test_rows(text)
+			if rows.len == 0 {
+				// unparsable: probe compile failed, suite never started, or
+				// the -stats shape changed — the raw text is the detail
+				tests_section = GateSection{
+					ok:     tc.exit_code == 0 && !tc.timed_out
+					detail: if tc.timed_out {
+						'test run timed out after ${tool_timeout_seconds} s'
+					} else {
+						text.trim_space()
+					}
+				}
+			} else {
+				tests_section = GateSection{
+					ok:   tc.exit_code == 0 && !tc.timed_out && rows.all(it.ok)
+					rows: rows
+				}
+			}
+		}
+	}
+
+	report := GateReport{
+		fmt_check: GateSection{ ok: fmt_ok, detail: fmt_detail }
+		vet:       GateSection{ ok: vet_ok, detail: vet_detail }
+		affected:  affected_files
+		tests_run: run
+		tests:     tests_section
+		ok:        fmt_ok && vet_ok && (!run || tests_section.ok)
+	}
+	body := json2.encode(report)
+	return if report.ok {
+		mcp.tool_text_result(truncate(body))
+	} else {
+		to_error_result(body)
+	}
+}
+
+// v_fmt_tool checks formatting without touching files: `v fmt -c` (exit
+// non-zero when anything drifts). With `diff` the reply also carries the
+// unified diff of what `v fmt` would change — `v fmt -diff`, ANSI-stripped.
+fn v_fmt_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[FmtCheckArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	validate_path(a.path) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	// no diff switch: the plain check, exit non-zero means drift
+	if !(a.diff or { false }) {
+		return run_v_tool(['v', 'fmt', '-c', a.path], tool_timeout_seconds)
+	}
+	// -c first: the file list names which files drift (`v fmt -diff` prints
+	// no per-file headers). Empty list = no drift at all — done, one spawn.
+	c := run_capture(['v', 'fmt', '-c', a.path], tool_timeout_seconds)
+	files_list := merge_streams(c.stdout, c.stderr).trim_space()
+	if files_list == '' {
+		if c.timed_out {
+			return to_error_result('command timed out after ${tool_timeout_seconds} s')
+		}
+		return mcp.tool_text_result('ok (exit 0, no output)')
+	}
+	d := run_capture(['v', 'fmt', '-diff', a.path], tool_timeout_seconds)
+	diff_text := strip_ansi(merge_streams(d.stdout, d.stderr).trim_space())
+	out := if diff_text == '' { files_list } else { files_list + '\n\ndiff:\n' + diff_text }
+	return if c.exit_code != 0 || d.exit_code != 0 || d.timed_out {
+		to_error_result(out)
+	} else {
+		mcp.tool_text_result(out)
+	}
+}
+
+// strip_ansi removes terminal color escape sequences (ESC [ … m and friends)
+// from tool output: the `v fmt -diff` report colors its hunks, and raw
+// escape codes only pollute an agent's context.
+fn strip_ansi(text string) string {
+	if !text.contains('\x1b') {
+		return text
+	}
+	mut out := []u8{cap: text.len}
+	mut i := 0
+	for i < text.len {
+		if text[i] == 27 && i + 1 < text.len && text[i + 1] == `[` {
+			// skip the parameter bytes (digits, ';', '?') to the final letter
+			mut j := i + 2
+			for j < text.len && (text[j].is_digit() || text[j] == `;` || text[j] == `?`) {
+				j++
+			}
+			is_letter := (text[j] >= `a` && text[j] <= `z`) || (text[j] >= `A` && text[j] <= `Z`)
+			if j < text.len && is_letter {
+				i = j + 1
+				continue
+			}
+		}
+		out << text[i]
+		i++
+	}
+	return out.bytestr()
 }
 
 // v_fmt_fix_tool closes the formatting loop: it runs `v fmt -w`, which
@@ -1398,27 +1639,23 @@ fn v_repo_brief_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 
 // ---- v_affected: run-only-what-a-change-can-affect via the vaffected lib ----
 
-fn v_affected_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
-	a := decode_args[AffectedArgs](arguments) or {
-		return to_error_result('bad arguments: ${err.msg()}')
-	}
-	validate_path(a.path) or {
-		return to_error_result('bad arguments: ${err.msg()}')
-	}
-	b := a.base or { 'HEAD' }
-	base := if b.len > 0 { b } else { 'HEAD' }
-
+// affected_test_files lists the *_test.v files a change can affect: git diff
+// (vs base, default HEAD) names the changed .v files, and the vaffected
+// library walks the static import graph from there. Shared by the v_affected
+// tool and the v_gate commit-gate report.
+fn affected_test_files(path string, base string) ![]string {
+	b := if base.len > 0 { base } else { 'HEAD' }
 	// Changed paths come from git, relative to a.path; the library receives
 	// them as plain data (same contract its CLI uses). Spawned like every
 	// other child (run_capture): streams split, timeout cap applied.
-	git := run_capture(['git', '-C', a.path, 'diff', '--name-only', base], tool_timeout_seconds)
+	git := run_capture(['git', '-C', path, 'diff', '--name-only', b], tool_timeout_seconds)
 	if git.exit_code != 0 || git.timed_out {
 		reason := if git.timed_out {
 			'git timed out after ${tool_timeout_seconds} s'
 		} else {
 			merge_streams(git.stdout, git.stderr)
 		}
-		return to_error_result('v_affected: git diff failed: ${reason.trim_space()}')
+		return error('git diff failed: ${reason.trim_space()}')
 	}
 	mut changed := []string{}
 	for row in git.stdout.split('\n') {
@@ -1430,11 +1667,35 @@ fn v_affected_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 			changed << p
 		}
 	}
-	out := vaffected.affected_report(a.path, changed) or {
+	out := vaffected.affected_report(path, changed) or {
+		return error('affected_report: ${err.msg()}')
+	}
+	mut files := []string{}
+	for row in out.split('\n') {
+		p := row.trim_space()
+		if p.len > 0 {
+			files << p
+		}
+	}
+	return files
+}
+
+// v_affected_tool renders the affected-test list as plain text: one file per
+// line (empty list means nothing to re-run).
+fn v_affected_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[AffectedArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	validate_path(a.path) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	files := affected_test_files(a.path, a.base or { '' }) or {
 		return to_error_result('v_affected: ${err.msg()}')
 	}
-	text := if out.len == 0 { 'no affected tests (nothing to re-run)' } else { out }
-	return mcp.tool_text_result(truncate(text))
+	if files.len == 0 {
+		return mcp.tool_text_result('no affected tests (nothing to re-run)')
+	}
+	return mcp.tool_text_result(truncate(files.join('\n')))
 }
 
 // ---- v_uses: who-uses-what queries via the vuses library --------------------
@@ -1477,7 +1738,7 @@ fn new_vlang_server() !mcp.Server {
 	mut server := mcp.new_server(
 		name:         server_name
 		version:      server_version
-		instructions: "V development server: compile, test (with a test-function glob only=… or a test-file filter files=…), format-check and format in place, vet, dump AST JSON, outline symbols, read one symbol's source (v_read), document a module, inspect v.mod, look up v.mod projects under a directory (v_where), brief a repo, run only affected tests, run a compiled program, run a standalone snippet with no project scaffolding (v_scratch), list compiler diagnostics as JSON, answer who-uses-what, and report its own build (v_server_info). PASS ABSOLUTE PATHS."
+		instructions: "V development server: compile, test (with a test-function glob only=… or a test-file filter files=…), format-check and format in place, vet, dump AST JSON, outline symbols, read one symbol's source (v_read), document a module, inspect v.mod, look up v.mod projects under a directory (v_where), brief a repo, run only affected tests, run a compiled program, run a standalone snippet with no project scaffolding (v_scratch), list compiler diagnostics as JSON, answer who-uses-what, take the one-call commit gate (v_gate: fmt + vet + affected tests, optionally run_tests), and report its own build (v_server_info). PASS ABSOLUTE PATHS."
 	)
 	server.add_tool(mcp.Tool{
 		name:         'v_build'
@@ -1496,7 +1757,7 @@ fn new_vlang_server() !mcp.Server {
 	}, v_scratch_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_errors'
-		description:  'Compile only; return compiler diagnostics as JSON [{file,line,col,kind,message}] with kind error/warning/note. An empty array means the build is clean. Optional vflags (JSON array of strings) are forwarded to the compiler, mirroring the v_build command; optional timeout (integer seconds, 1..1800, default 600) raises the compile cap.'
+		description:  'Compile only; return compiler diagnostics as JSON [{file,line,col,kind,message}] with kind error/warning/note. An empty array means the build is clean. Optional vflags (JSON array of strings) are forwarded to the compiler, mirroring the v_build command; optional timeout (integer seconds, 1..1800, default 600) raises the compile cap; optional limit (integer ≥ 1) caps the rows at the first N — when more rows exist the reply is an object {rows,total,truncated:true} instead of the array.'
 		input_schema: v_errors_schema
 	}, v_errors_tool)!
 	server.add_tool(mcp.Tool{
@@ -1505,9 +1766,14 @@ fn new_vlang_server() !mcp.Server {
 		input_schema: v_test_schema
 	}, v_test_tool)!
 	server.add_tool(mcp.Tool{
+		name:         'v_gate'
+		description:  'One-call commit gate (path = project directory): formatting check (v fmt -c), vet (warnings ride along as detail, only real failures block), the affected *_test.v subset (git diff vs default HEAD or base), and — under optional run_tests (boolean) — the affected tests executed as a narrowed v -stats test run. Returns a JSON report {fmt_check,vet,affected,tests_run,tests,ok}; the tool is an error result while ok=false. Use it as the commit gate instead of chaining v_fmt_check + v_vet + v_affected + v_test.'
+		input_schema: v_gate_schema
+	}, v_gate_tool)!
+	server.add_tool(mcp.Tool{
 		name:         'v_fmt_check'
-		description:  'Run `v fmt -c` (check-only) on a file or directory (path). Non-zero exit if unformatted; use v_fmt to format in place.'
-		input_schema: path_args_schema
+		description:  'Run `v fmt -c` (check-only) on a file or directory (path). Non-zero exit if unformatted; use v_fmt to format in place. Optional diff (boolean) also returns the unified diff of what v fmt would change — the unformatted file list followed by the (ANSI-stripped) diff, error result while drift exists.'
+		input_schema: fmt_check_schema
 	}, v_fmt_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_fmt'
