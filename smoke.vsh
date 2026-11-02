@@ -41,7 +41,7 @@ p.close()
 println(out.replace('\n', '\n--- '))
 
 checks := ['"id":1', '"protocolVersion"', '"v_build"', '"v_symbols"', '"v_repo_brief"', '"v_affected"',
-	'"isError":false', 'server_name']
+	'"v_run"', '"v_errors"', '"isError":false', 'server_name']
 mut ok := true
 for c in checks {
 	if !out.contains(c) {
@@ -53,8 +53,10 @@ for c in checks {
 // Schema-validation guard: every tool must advertise the `path` property in
 // its inputSchema. Clients validate arguments against these schemas, so a
 // tool whose schema has no properties (the mcp module default) silently
-// receives no arguments. The eight tools share one schema const, so the
-// number of "name":"v_ entries must match the number of path properties.
+// receives no arguments. The path-only tools share one schema const;
+// `v_run` and `v_affected` declare their own consts with `path` first —
+// either way, the number of "name":"v_ entries must match the number of
+// path properties.
 n_tools := out.count('"name":"v_')
 n_props := out.count('"properties":{"path":{')
 if n_tools == 0 || n_props != n_tools {

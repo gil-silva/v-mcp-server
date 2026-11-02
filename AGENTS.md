@@ -127,8 +127,10 @@ V-specific rules. Full reference: `../v-release-052/v/AGENTS.md`.
 
 `bin/v-mcp-server` is the stdio MCP server this repo builds, and coding agents
 running in this workspace are expected to use it instead of spawning `v`
-directly. It exposes nine tools, each taking an absolute `path`:
-`v_build`, `v_test`, `v_fmt_check`, `v_vet`, `v_ast`, `v_symbols`, `v_deps`,
+directly. It exposes eleven tools, each taking an absolute `path`:
+`v_build`, `v_errors` (compile-only diagnostics as JSON rows) and `v_run`
+(compile then execute, optional `args` argv), `v_test`, `v_fmt_check`,
+`v_vet`, `v_ast`, `v_symbols`, `v_deps`,
 `v_repo_brief` (maps a V repo via the `vrepo` library) and `v_affected`
 (affected-test set via the `vaffected` library; optional `base` git rev).
 

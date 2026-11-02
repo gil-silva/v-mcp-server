@@ -17,7 +17,7 @@ import gil_silva.vaffected.vaffected
 
 const server_name = 'v-mcp-server'
 
-const server_version = '0.2.0'
+const server_version = '0.3.0'
 
 // output_byte_limit caps any tool output, so agents never choke on
 // multi-megabyte AST dumps or test logs.
@@ -33,10 +33,33 @@ const path_args_schema = '{"type":"object","properties":{"path":{"description":"
 // base the tool diffs against HEAD.
 const v_affected_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V project directory","type":"string"},"base":{"description":"Git rev to diff against (default: HEAD)","type":"string"}},"required":["path"],"additionalProperties":false}'
 
+// v_run_schema declares path as required and args as optional argv; without
+// args the program runs with none. `path` must stay the first property —
+// smoke.vsh counts `"properties":{"path":{` occurrences server-wide.
+const v_run_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V file or project directory","type":"string"},"args":{"description":"Positional arguments passed to the compiled program (optional, JSON array of strings)","type":"array","items":{"type":"string"}}},"required":["path"],"additionalProperties":false}'
+
 // PathArgs is the common `arguments` payload of the tools below:
 // a path to a single .v file or a project directory.
 struct PathArgs {
 	path string
+}
+
+// RunArgs is the payload of v_run: path plus optional positional arguments
+// (argv) forwarded to the compiled program.
+struct RunArgs {
+	path string
+	args ?[]string
+}
+
+// One compiler diagnostic, as emitted by `v` on the header line
+// `file.v:LINE:COL: kind: message`.
+struct Diagnostic {
+pub:
+	file    string
+	line    int
+	col     int
+	kind    string
+	message string
 }
 
 // AffectedArgs is the payload of v_affected: path plus the optional git rev
@@ -56,11 +79,13 @@ fn decode_args[T](arguments string) !T {
 // interactive prompt) must not silently queue every other call behind it.
 const tool_timeout_seconds = 600
 
-// run_v_tool executes a `v` subcommand and wraps its output in an MCP tool
-// result. A non-zero exit code yields an error result carrying both streams.
-// Children are polled (os.Process has no timed wait in v 0.5.2) and killed
-// after tool_timeout_seconds: SIGTERM first, then SIGKILL after 3 s.
-fn run_v_tool(args []string) mcp.ToolResult {
+// run_capture spawns args[0] with args[1..] and polls it like run_v_tool's
+// callers expect: no timed wait exists in v 0.5.2 (os.Process), so the child
+// is checked every 500 ms until tool_timeout_seconds (SIGTERM, then SIGKILL
+// after 3 s). Returns the two streams unmerged, plus exit state and the
+// timeout flag. Shared by run_v_tool, v_run and v_errors, which format the
+// result each in their own way.
+fn run_capture(args []string) (string, string, int, bool) {
 	mut p := os.new_process(args[0])
 	p.set_args(args[1..])
 	p.set_redirect_stdio()
@@ -87,12 +112,23 @@ fn run_v_tool(args []string) mcp.ToolResult {
 	defer {
 		p.close()
 	}
+	return stdout, stderr, exit_code, timed_out
+}
 
+// merge_streams joins captured stdout/stderr the way run_v_tool displays them.
+fn merge_streams(stdout string, stderr string) string {
 	mut out := stdout
 	if stderr.len > 0 {
 		out += if out.len > 0 { '\n' } else { '' } + stderr
 	}
-	out = out.trim_space()
+	return out.trim_space()
+}
+
+// run_v_tool executes a `v` subcommand and wraps its output in an MCP tool
+// result. A non-zero exit code yields an error result carrying both streams.
+fn run_v_tool(args []string) mcp.ToolResult {
+	stdout, stderr, exit_code, timed_out := run_capture(args)
+	mut out := merge_streams(stdout, stderr)
 	if exit_code != 0 || timed_out {
 		if out.len == 0 {
 			if timed_out {
@@ -173,6 +209,140 @@ fn v_ast_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	}
 	// `-p` prints the AST JSON to stdout instead of writing a sidecar file.
 	return run_v_tool(['v', 'ast', '-p', a.path])
+}
+
+// ---- v_run: compile once, then execute the binary ---------------------------
+
+fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[RunArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	bin := tmp_output_path('run_target')
+	defer {
+		os.rm(bin) or {}
+	}
+
+	// Same failure contract as run_v_tool: an error result carrying whatever
+	// the compiler printed (or a fallback line when it printed nothing).
+	bout, berr, bcode, btime_out := run_capture(['v', '-o', bin, '-no-parallel', a.path])
+	if bcode != 0 || btime_out {
+		mut btext := merge_streams(bout, berr)
+		if btext.len == 0 {
+			btext = if btime_out {
+				'build timed out after ${tool_timeout_seconds} s'
+			} else {
+				'build failed with exit code ${bcode}'
+			}
+		}
+		return to_error_result('v_run build failed:\n${btext}')
+	}
+	blog := merge_streams(bout, berr)
+
+	args := a.args or { []string{} }
+	mut pargs := []string{cap: args.len + 1}
+	pargs << bin
+	pargs << args
+	stdout, stderr, code, timed_out := run_capture(pargs)
+	ptext := merge_streams(stdout, stderr)
+	mut parts := []string{}
+	if blog.len > 0 {
+		parts << 'compiler output:\n${blog}'
+	}
+	if ptext.len > 0 {
+		parts << ptext
+	}
+	if timed_out {
+		parts << 'program timed out after ${tool_timeout_seconds} s'
+		return to_error_result(truncate(parts.join('\n')))
+	}
+	if code != 0 {
+		parts << 'program exited with code ${code}'
+		return to_error_result(truncate(parts.join('\n')))
+	}
+	if parts.len == 0 {
+		parts << 'ok (exit 0, no output)'
+	}
+	return mcp.tool_text_result(truncate(parts.join('\n')))
+}
+
+// ---- v_errors: compile-only, structured diagnostics -------------------------
+
+fn v_errors_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[PathArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	bin := tmp_output_path('errors_target')
+	defer {
+		os.rm(bin) or {}
+	}
+	stdout, stderr, code, timed_out := run_capture(['v', '-o', bin, '-no-parallel', a.path])
+	text := merge_streams(stdout, stderr)
+	diags := parse_diagnostics(text)
+	if diags.len == 0 && (code != 0 || timed_out) {
+		// Failed without parseable output; surface it raw instead of letting
+		// `[]` pass as "clean build".
+		fallback := if timed_out {
+			'build timed out after ${tool_timeout_seconds} s'
+		} else {
+			'build failed (exit ${code}) with no parseable diagnostics'
+		}
+		return to_error_result('v_errors: ${fallback}:\n${truncate(text)}')
+	}
+	body := json2.encode(diags)
+	return mcp.tool_text_result(truncate(body))
+}
+
+// parse_diagnostics extracts one-line compiler diagnostics from `v` output —
+// header lines shaped `file.v:LINE:COL: kind: message` (kind: error,
+// warning, note — `builder error` counts as error). Source-context lines and
+// anything else pass by. Equal consecutive headers are deduplicated, since
+// the same diagnostic can surface in both captured streams.
+fn parse_diagnostics(text string) []Diagnostic {
+	mut diags := []Diagnostic{}
+	for raw_line in text.split_into_lines() {
+		line := raw_line.trim_space()
+		parts := line.split(':')
+		if parts.len < 4 || !parts[0].ends_with('.v') {
+			continue
+		}
+		src_line := parts[1].int()
+		src_col := parts[2].int()
+		if src_line < 1 || src_col < 1 {
+			continue
+		}
+		rest := parts[3..].join(':').trim_space()
+		mut kind_word := rest
+		mut msg := ''
+		sep := rest.index(': ') or { -1 }
+		if sep >= 0 {
+			kind_word = rest[..sep]
+			msg = rest[sep + 2..]
+		}
+		kind := diagnostic_kind(kind_word)
+		if kind == '' {
+			continue
+		}
+		d := Diagnostic{ file: parts[0], line: src_line, col: src_col, kind: kind, message: msg }
+		if diags.any(it == d) {
+			continue
+		}
+		diags << d
+	}
+	return diags
+}
+
+// diagnostic_kind maps a severity word to one of error/warning/note, or ''
+// when the word is not a severity.
+fn diagnostic_kind(word string) string {
+	return if word.contains('error') {
+		'error'
+	} else if word.contains('warning') {
+		'warning'
+	} else if word.contains('note') {
+		'note'
+	} else {
+		''
+	}
 }
 
 // ---- v_symbols: a pure-V symbol outline (no subprocess) ---------------------
@@ -335,13 +505,23 @@ fn new_vlang_server() !mcp.Server {
 	mut server := mcp.new_server(
 		name:         server_name
 		version:      server_version
-		instructions: 'V development server: compile, test, format-check, vet, dump AST JSON, outline symbols, inspect v.mod, brief a repo, run only affected tests. PASS ABSOLUTE PATHS.'
+		instructions: 'V development server: compile, test, format-check, vet, dump AST JSON, outline symbols, inspect v.mod, brief a repo, run only affected tests, run a compiled program, list compiler diagnostics as JSON. PASS ABSOLUTE PATHS.'
 	)
 	server.add_tool(mcp.Tool{
 		name:         'v_build'
 		description:  'Compile a V file or project (path) and return compiler diagnostics.'
 		input_schema: path_args_schema
 	}, v_build_tool)!
+	server.add_tool(mcp.Tool{
+		name:         'v_run'
+		description:  'Compile path, then execute it. Optional args (JSON array of strings) are passed to the program. Returns the program output; compile failures return the compiler diagnostics as an error. Timeout and output caps apply.'
+		input_schema: v_run_schema
+	}, v_run_tool)!
+	server.add_tool(mcp.Tool{
+		name:         'v_errors'
+		description:  'Compile only; return compiler diagnostics as JSON [{file,line,col,kind,message}] with kind error/warning/note. An empty array means the build is clean.'
+		input_schema: path_args_schema
+	}, v_errors_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_test'
 		description:  'Run `v test` on a file or project (path) and return results.'

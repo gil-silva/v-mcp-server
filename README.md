@@ -119,6 +119,8 @@ Open your agent in any V project and just ask normal things:
 | Tool          | Arguments | What it does |
 |---------------|-----------|--------------|
 | `v_build`     | `{path}`  | compiles and returns compiler diagnostics |
+| `v_run`       | `{path, args?}` | compiles `path`, executes the binary; optional `args` (JSON array of strings) become the program's argv, output returned |
+| `v_errors`    | `{path}`  | compile-only; diagnostics as JSON `[{file,line,col,kind,message}]` — `[]` means clean |
 | `v_test`      | `{path}`  | runs `v test` |
 | `v_fmt_check` | `{path}`  | `v fmt -c` — check only, never touches files |
 | `v_vet`       | `{path}`  | `v vet` warnings |
