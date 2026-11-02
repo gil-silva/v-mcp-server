@@ -54,9 +54,8 @@ sequenceDiagram
 
 ## Install & connect in three minutes
 
-**1. Have V (from source, current `master`).** The `mcp` module this server
-builds on is newer than the last stable release, so released versions (like
-`0.5.2`) are not enough yet. The V project's own recipe is two commands:
+**1. Have V (from source, current `master`).** The V project's own recipe is
+two commands:
 
 ```bash
 git clone --depth 1 https://github.com/vlang/v && cd v && make
