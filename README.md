@@ -7,7 +7,7 @@ structured diagnostics, smart test selection, repo maps — over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
 [![CI](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-0.5.0-4a6b9e)
+![version](https://img.shields.io/badge/version-0.6.0-4a6b9e)
 ![vpm](https://img.shields.io/badge/vpm-gil--silva.vmcpserver-8a5f4a)
 ![license](https://img.shields.io/badge/license-MIT-3a8a5f)
 
@@ -177,14 +177,15 @@ one-call patterns), so the savings show up in your context every session.
 | Tool          | Arguments | What it does |
 |---------------|-----------|--------------|
 | `v_build`     | `{path, vflags?}` | compiles and returns compiler diagnostics; optional `vflags` (JSON array of strings) is forwarded verbatim to the V CLI (e.g. `-g`, `-prod`, `-cc clang`, `-d flag`) |
-| `v_run`       | `{path, args?, vflags?}` | compiles `path`, executes the binary; optional `args` (JSON array of strings) become the program's argv, optional `vflags` are forwarded to the compiler, output returned |
+| `v_run`       | `{path, args?, vflags?}` | compiles `path`, executes the binary; optional `args` (JSON array of strings) become the program's argv, optional `vflags` are forwarded to the compiler, output returned with stdout/stderr labeled |
 | `v_errors`    | `{path}`  | compile-only; diagnostics as JSON `[{file,line,col,kind,message}]` — `[]` means clean |
-| `v_test`      | `{path}`  | runs `v test` |
+| `v_test`      | `{path, only?}` | runs `v test`; optional `only` is a test-function glob forwarded as `VTEST_ONLY_FN` (via `env(1)`) |
 | `v_fmt_check` | `{path}`  | `v fmt -c` — check only, never touches files |
 | `v_fmt`       | `{path}`  | `v fmt -w` — format in place (mutates files) |
 | `v_vet`       | `{path}`  | `v vet` warnings |
 | `v_ast`       | `{path}`  | `v ast -p` AST JSON (output capped at 100 kB) |
 | `v_symbols`   | `{path}`  | outline of fns/structs/interfaces/enums/consts/types + line numbers |
+| `v_doc`       | `{path}`  | `v doc` — generated module documentation for a module directory |
 | `v_deps`      | `{path}`  | name/version/license/dependencies from `v.mod` |
 | `v_repo_brief`| `{path}`  | compact repo map: module identity, entry points, tree with LOC, per-file symbol outlines (~40k char cap) |
 | `v_affected`  | `{path, base?}` | `*_test.v` files a change can affect: git diff vs `base` (default `HEAD`), propagated through the static import graph |

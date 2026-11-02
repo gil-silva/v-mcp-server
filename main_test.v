@@ -94,7 +94,7 @@ fn test_v_repo_brief_call_round_trip() {
 		}) or { panic('tools/call: ${err.msg()}') }
 	assert !res.is_error, res.content
 	assert res.content.contains('vrepo brief — '), res.content
-	assert res.content.contains('module: vmcpserver 0.5.0 [MIT]'), res.content
+	assert res.content.contains('module: vmcpserver 0.6.0 [MIT]'), res.content
 	assert res.content.contains('entry points: main.v'), res.content
 }
 
@@ -204,6 +204,8 @@ fn test_v_run_and_v_errors_round_trips() {
 		}) or { panic('tools/call v_run: ${err.msg()}') }
 	assert !res.is_error, res.content
 	assert res.content.contains('run-ok'), res.content
+	// streams arrive labeled (stdout documented before stderr)
+	assert res.content.contains('program stdout:'), res.content
 
 	// v_run on a compile-broken file: error result carrying the diagnostics
 	bad := os.join_path(os.temp_dir(), 'v_run_bad_${os.getpid()}.v')
@@ -233,6 +235,28 @@ fn test_v_run_and_v_errors_round_trips() {
 	// content is JSON-wrapped, so inner quotes appear escaped
 	assert res3.content.contains('\\"kind\\":\\"error\\"'), res3.content
 	assert res3.content.contains('\\"line\\":2'), res3.content
+
+	// labeled streams: both sections, stdout documented first
+	streams := os.join_path(os.temp_dir(), 'v_run_streams_${os.getpid()}.v')
+	os.write_file(streams, 'fn main() {\n\tprintln("to-stdout")\n\teprintln("to-stderr")\n}\n')!
+	defer {
+		os.rm(streams) or {}
+	}
+	res4 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_run'
+			arguments: {
+				'path': json2.Any(streams)
+			}
+		}) or { panic('tools/call v_run streams: ${err.msg()}') }
+	assert !res4.is_error, res4.content
+	// content is JSON-wrapped: the newline between label and payload is escaped
+	assert res4.content.contains('program stdout:\\nto-stdout'), res4.content
+	assert res4.content.contains('program stderr:\\nto-stderr'), res4.content
+	// string.index is ?int; unwrap before comparing positions
+	sopt := res4.content.index('program stdout:') or { -1 }
+	sept := res4.content.index('program stderr:') or { -1 }
+	assert sopt < sept, res4.content
 }
 
 fn test_v_uses_call_round_trip() {

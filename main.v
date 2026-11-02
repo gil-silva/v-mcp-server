@@ -2,8 +2,8 @@
 // An MCP (Model Context Protocol) server that exposes V development tooling
 // to coding agents: program compilation and execution, structured build
 // errors, test runs, formatting checks (verify and in-place fix), vet
-// warnings, AST dumps, symbol outlines, repo briefs, v.mod inspection,
-// affected-test selection, who-uses-what queries (definitions, callers,
+// warnings, AST dumps, symbol outlines, module docs (v_doc), repo briefs,
+// v.mod inspection, affected-test selection, who-uses-what queries (definitions, callers,
 // interface implementations) and a server build/info report.
 //
 // Built on the official `mcp` module of the V standard library; serves
@@ -21,7 +21,7 @@ import gil_silva.vuses.vuses
 
 const server_name = 'v-mcp-server'
 
-const server_version = '0.5.0'
+const server_version = '0.6.0'
 
 // output_byte_limit caps any tool output, so agents never choke on
 // multi-megabyte AST dumps or test logs.
@@ -53,6 +53,12 @@ const v_build_schema = '{"type":"object","properties":{"path":{"description":"Ab
 // enforcing the `path`-property invariant of every other tool.
 const server_info_schema = '{"type":"object","properties":{},"additionalProperties":false}'
 
+// v_test_schema declares path as required and only as an optional glob that
+// selects which test functions run, forwarded via the VTEST_ONLY_FN
+// environment variable (through env(1)); `path` must stay the first property
+// — smoke.vsh counts `"properties":{"path":{` occurrences server-wide.
+const v_test_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V test file or project directory","type":"string"},"only":{"description":"VTEST_ONLY_FN glob: run only test functions whose name matches (optional string, e.g. \\"*handshake*\\")","type":"string"}},"required":["path"],"additionalProperties":false}'
+
 // v_uses_schema declares path as required and symbol as an optional string
 // the tool itself validates; same `path`-first rule as every other schema.
 const v_uses_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V project directory to scan","type":"string"},"symbol":{"description":"The declared V symbol name to query (fn/method/struct/interface/enum/const/type name)","type":"string"}},"required":["path"],"additionalProperties":false}'
@@ -61,6 +67,12 @@ const v_uses_schema = '{"type":"object","properties":{"path":{"description":"Abs
 // a path to a single .v file or a project directory.
 struct PathArgs {
 	path string
+}
+
+// TestArgs is the payload of v_test: a path plus an optional VTEST_ONLY glob.
+struct TestArgs {
+	path string
+	only ?string
 }
 
 // BuildArgs is the payload of v_build: a path plus optional CLI flags
@@ -296,13 +308,15 @@ fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	pargs << args
 
 	prog := run_capture(pargs)
-	program_text := merge_streams(prog.stdout, prog.stderr)
 	mut parts := []string{}
 	if build_log.len > 0 {
 		parts << 'compiler output:\n${build_log}'
 	}
-	if program_text.len > 0 {
-		parts << program_text
+	if prog.stdout.len > 0 {
+		parts << 'program stdout:\n${prog.stdout.trim_space()}'
+	}
+	if prog.stderr.len > 0 {
+		parts << 'program stderr:\n${prog.stderr.trim_space()}'
 	}
 	if prog.timed_out {
 		parts << 'program timed out after ${tool_timeout_seconds} s'
@@ -402,13 +416,22 @@ fn diagnostic_kind(word string) string {
 }
 
 fn v_test_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
-	a := decode_args[PathArgs](arguments) or {
+	a := decode_args[TestArgs](arguments) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
 	validate_path(a.path) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
-	return run_v_tool(['v', '-no-parallel', 'test', a.path])
+	only := a.only or { '' }.trim_space()
+	if only.len == 0 {
+		return run_v_tool(['v', '-no-parallel', 'test', a.path])
+	}
+	// VTEST_ONLY_FN selects test functions through the environment, but
+	// os.Process.set_environment *replaces* the child environment outright
+	// (PATH, HOME and friends would vanish) — so forward through env(1),
+	// which appends to the inherited environment instead. (VTEST_ONLY
+	// filters file paths; VTEST_ONLY_FN filters test function names.)
+	return run_v_tool(['env', 'VTEST_ONLY_FN=${only}', 'v', '-no-parallel', 'test', a.path])
 }
 
 fn v_fmt_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
@@ -547,6 +570,20 @@ fn v_symbols_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	return mcp.tool_text_result('line\tkind\tname\n' + b.join('\n'))
 }
 
+// ---- v_doc: generated module docs --------------------------------------------
+
+// v_doc_tool documents a module: the `v doc` output for a module directory
+// (path), so agents read generated docs instead of paging through source.
+fn v_doc_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[PathArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	validate_path(a.path) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	return run_v_tool(['v', 'doc', a.path])
+}
+
 // ---- v_deps: read a project's v.mod -----------------------------------------
 
 fn v_deps_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
@@ -661,7 +698,7 @@ fn new_vlang_server() !mcp.Server {
 	mut server := mcp.new_server(
 		name:         server_name
 		version:      server_version
-		instructions: 'V development server: compile, test, format-check and format in place, vet, dump AST JSON, outline symbols, inspect v.mod, brief a repo, run only affected tests, run a compiled program, list compiler diagnostics as JSON, answer who-uses-what, and report its own build (v_server_info). PASS ABSOLUTE PATHS.'
+		instructions: 'V development server: compile, test (with a test-function glob only=…), format-check and format in place, vet, dump AST JSON, outline symbols, document a module, inspect v.mod, brief a repo, run only affected tests, run a compiled program, list compiler diagnostics as JSON, answer who-uses-what, and report its own build (v_server_info). PASS ABSOLUTE PATHS.'
 	)
 	server.add_tool(mcp.Tool{
 		name:         'v_build'
@@ -680,8 +717,8 @@ fn new_vlang_server() !mcp.Server {
 	}, v_errors_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_test'
-		description:  'Run `v test` on a file or project (path) and return results.'
-		input_schema: path_args_schema
+		description:  'Run `v test` on a file or project (path). Optional only (string) is a VTEST_ONLY_FN glob forwarded via env(1) — run only test functions whose name matches, e.g. "*handshake*".'
+		input_schema: v_test_schema
 	}, v_test_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_fmt_check'
@@ -708,6 +745,11 @@ fn new_vlang_server() !mcp.Server {
 		description:  'List top-level symbols (fn/method/struct/interface/enum/const/type + line numbers) of a .v file (path).'
 		input_schema: path_args_schema
 	}, v_symbols_tool)!
+	server.add_tool(mcp.Tool{
+		name:         'v_doc'
+		description:  'Run `v doc` on a module directory (path) and return the generated module documentation.'
+		input_schema: path_args_schema
+	}, v_doc_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_deps'
 		description:  'Read name/version/license/dependencies from the v.mod of a project (path).'
