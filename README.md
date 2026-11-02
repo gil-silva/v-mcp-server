@@ -7,7 +7,7 @@ structured diagnostics, smart test selection, repo maps — over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
 [![CI](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-0.3.0-4a6b9e)
+![version](https://img.shields.io/badge/version-0.4.0-4a6b9e)
 ![vpm](https://img.shields.io/badge/vpm-gil--silva.vmcpserver-8a5f4a)
 ![license](https://img.shields.io/badge/license-MIT-3a8a5f)
 
@@ -66,7 +66,7 @@ git clone --depth 1 https://github.com/vlang/v && cd v && make
 **2. Build the server once:**
 
 ```bash
-v install gil-silva.vrepo gil-silva.vaffected
+v install gil-silva.vrepo gil-silva.vaffected gil-silva.vuses
 cd v-mcp-server
 v .        # builds bin/v-mcp-server
 ```
@@ -154,6 +154,10 @@ Open your agent in any V project and just ask normal things:
 > *"Only re-run what this refactor can actually break."*
 > → `v_affected` — the moved-import graph decides test scope
 
+> *"Who calls this function — and what implements this interface?"*
+> → `v_uses` — definitions, call sites with their enclosing fn, and
+> name-approximated implementers, with every section that has hits
+
 ## Token & time economy — by construction
 
 No benchmark inflation here: these are structural guarantees (caps and
@@ -183,6 +187,7 @@ one-call patterns), so the savings show up in your context every session.
 | `v_deps`      | `{path}`  | name/version/license/dependencies from `v.mod` |
 | `v_repo_brief`| `{path}`  | compact repo map: module identity, entry points, tree with LOC, per-file symbol outlines (~40k char cap) |
 | `v_affected`  | `{path, base?}` | `*_test.v` files a change can affect: git diff vs `base` (default `HEAD`), propagated through the static import graph |
+| `v_uses`      | `{path, symbol}` | who-uses-what for a declared symbol: definitions (`file:line` per kind), call/constructor sites with the enclosing fn/method, and — when the symbol names an interface — approximated implementing types; comments/strings scrubbed |
 
 All tools expect **absolute** paths (e.g. `/home/you/vlang/vzed`), because
 the server doesn't know which folder your agent was opened in.
@@ -224,8 +229,11 @@ connect.
   [vlang/v-mascot](https://github.com/vlang/v-mascot)
   (CC [BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) — a
   chibi variant may still join this README).
-- The two libraries it leans on, [`vrepo`](https://github.com/gil-silva/vrepo)
-  (repo briefs) and
+- The three libraries it leans on,
+  [`vrepo`](https://github.com/gil-silva/vrepo) (repo briefs),
   [`vaffected`](https://github.com/gil-silva/vaffected) (affected-test
-  graph), are published on vpm and usable without MCP.
+  graph) and
+  [`vuses`](https://github.com/gil-silva/vuses) (who-uses-what: definitions,
+  callers, interface implementations), are published on vpm and usable
+  without MCP.
 - License: MIT (see [LICENSE](LICENSE)).

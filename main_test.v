@@ -68,6 +68,7 @@ fn test_compile_and_handshake() {
 	assert names.contains('v_symbols'), names.str()
 	assert names.contains('v_deps'), names.str()
 	assert names.contains('v_repo_brief'), names.str()
+	assert names.contains('v_uses'), names.str()
 }
 
 fn test_v_repo_brief_call_round_trip() {
@@ -93,7 +94,7 @@ fn test_v_repo_brief_call_round_trip() {
 		}) or { panic('tools/call: ${err.msg()}') }
 	assert !res.is_error, res.content
 	assert res.content.contains('vrepo brief — '), res.content
-	assert res.content.contains('module: vmcpserver 0.3.0 [MIT]'), res.content
+	assert res.content.contains('module: vmcpserver 0.4.0 [MIT]'), res.content
 	assert res.content.contains('entry points: main.v'), res.content
 }
 
@@ -232,4 +233,43 @@ fn test_v_run_and_v_errors_round_trips() {
 	// content is JSON-wrapped, so inner quotes appear escaped
 	assert res3.content.contains('\\"kind\\":\\"error\\"'), res3.content
 	assert res3.content.contains('\\"line\\":2'), res3.content
+}
+
+fn test_v_uses_call_round_trip() {
+	bin := compile_server()
+	defer {
+		os.rm(bin) or {}
+	}
+	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
+		panic('connect_stdio: ${err.msg()}')
+	}
+	defer {
+		client.close()
+	}
+	client.initialize()!
+
+	// who uses run_capture? — the report shows its definition and callers
+	res := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_uses'
+			arguments: {
+				'path':   json2.Any(@VMODROOT)
+				'symbol': json2.Any('run_capture')
+			}
+		}) or { panic('tools/call v_uses: ${err.msg()}') }
+	assert !res.is_error, res.content
+	assert res.content.contains('## definitions'), res.content
+	assert res.content.contains('fn run_capture'), res.content
+	assert res.content.contains('## callers'), res.content
+
+	// a missing symbol argument is a tool error, not a crash
+	res2 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_uses'
+			arguments: {
+				'path': json2.Any(@VMODROOT)
+			}
+		}) or { panic('tools/call v_uses bad: ${err.msg()}') }
+	assert res2.is_error, res2.content
+	assert res2.content.contains('symbol'), res2.content
 }

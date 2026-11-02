@@ -2,7 +2,8 @@
 // An MCP (Model Context Protocol) server that exposes V development tooling
 // to coding agents: program compilation and execution, structured build
 // errors, test runs, formatting checks, vet warnings, AST dumps, symbol
-// outlines, repo briefs, v.mod inspection and affected-test selection.
+// outlines, repo briefs, v.mod inspection, affected-test selection and
+// who-uses-what queries (definitions, callers, interface implementations).
 //
 // Built on the official `mcp` module of the V standard library; serves
 // over stdio (newline-delimited JSON-RPC), the transport used by Claude
@@ -15,10 +16,11 @@ import os
 import time
 import gil_silva.vrepo.vrepo
 import gil_silva.vaffected.vaffected
+import gil_silva.vuses.vuses
 
 const server_name = 'v-mcp-server'
 
-const server_version = '0.3.0'
+const server_version = '0.4.0'
 
 // output_byte_limit caps any tool output, so agents never choke on
 // multi-megabyte AST dumps or test logs.
@@ -38,6 +40,10 @@ const v_affected_schema = '{"type":"object","properties":{"path":{"description":
 // args the program runs with none. `path` must stay the first property —
 // smoke.vsh counts `"properties":{"path":{` occurrences server-wide.
 const v_run_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V file or project directory","type":"string"},"args":{"description":"Positional arguments passed to the compiled program (optional, JSON array of strings)","type":"array","items":{"type":"string"}}},"required":["path"],"additionalProperties":false}'
+
+// v_uses_schema declares path as required and symbol as an optional string
+// the tool itself validates; same `path`-first rule as every other schema.
+const v_uses_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V project directory to scan","type":"string"},"symbol":{"description":"The declared V symbol name to query (fn/method/struct/interface/enum/const/type name)","type":"string"}},"required":["path"],"additionalProperties":false}'
 
 // PathArgs is the common `arguments` payload of the tools below:
 // a path to a single .v file or a project directory.
@@ -68,6 +74,13 @@ pub:
 struct AffectedArgs {
 	path string
 	base ?string
+}
+
+// UsesArgs is the payload of v_uses: the project (path) to scan and the
+// declared symbol name to query. An empty symbol is a tool-level error.
+struct UsesArgs {
+	path   string
+	symbol string
 }
 
 // decode_args parses a tool `arguments` JSON into T.
@@ -511,13 +524,29 @@ fn v_affected_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	return mcp.tool_text_result(truncate(text))
 }
 
+// ---- v_uses: who-uses-what queries via the vuses library --------------------
+
+fn v_uses_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[UsesArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	symbol := a.symbol.trim_space()
+	if symbol.len == 0 {
+		return to_error_result('v_uses: the "symbol" argument is required (the declared name to query, e.g. run_v_tool)')
+	}
+	ix := vuses.analyze(a.path) or {
+		return to_error_result('v_uses: ${err.msg()}')
+	}
+	return mcp.tool_text_result(truncate(ix.report(a.path, symbol)))
+}
+
 // ---- server wiring ----------------------------------------------------------
 
 fn new_vlang_server() !mcp.Server {
 	mut server := mcp.new_server(
 		name:         server_name
 		version:      server_version
-		instructions: 'V development server: compile, test, format-check, vet, dump AST JSON, outline symbols, inspect v.mod, brief a repo, run only affected tests, run a compiled program, list compiler diagnostics as JSON. PASS ABSOLUTE PATHS.'
+		instructions: 'V development server: compile, test, format-check, vet, dump AST JSON, outline symbols, inspect v.mod, brief a repo, run only affected tests, run a compiled program, list compiler diagnostics as JSON, and answer who-uses-what (definitions/callers/implementations of a declared symbol). PASS ABSOLUTE PATHS.'
 	)
 	server.add_tool(mcp.Tool{
 		name:         'v_build'
@@ -574,6 +603,11 @@ fn new_vlang_server() !mcp.Server {
 		description:  'List the *_test.v files a change can affect: diffs path against the optional git rev base (default HEAD) and propagates changed files backwards through the static import graph. Empty result means nothing to re-run.'
 		input_schema: v_affected_schema
 	}, v_affected_tool)!
+	server.add_tool(mcp.Tool{
+		name:         'v_uses'
+		description:  'Answer who-uses-what for a declared symbol: definitions (file:line per kind), call/constructor sites with the enclosing fn/method, and — when the symbol names an interface — approximated implementing types. Declared-name matching, comments and strings scrubbed. Text report, capped.'
+		input_schema: v_uses_schema
+	}, v_uses_tool)!
 	return server
 }
 
