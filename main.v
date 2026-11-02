@@ -33,14 +33,36 @@ fn decode_args[T](arguments string) !T {
 	return json2.decode[T](arguments, json2.DecoderOptions{})!
 }
 
+// tool_timeout_seconds caps any spawned `v` subcommand. The server processes
+// tool calls sequentially, so one wedged child (a hung test runner, an
+// interactive prompt) must not silently queue every other call behind it.
+const tool_timeout_seconds = 600
+
 // run_v_tool executes a `v` subcommand and wraps its output in an MCP tool
 // result. A non-zero exit code yields an error result carrying both streams.
+// Children are polled (os.Process has no timed wait in v 0.5.2) and killed
+// after tool_timeout_seconds: SIGTERM first, then SIGKILL after 3 s.
 fn run_v_tool(args []string) mcp.ToolResult {
 	mut p := os.new_process(args[0])
 	p.set_args(args[1..])
 	p.set_redirect_stdio()
 	p.run()
-	p.wait()
+	start := time.now().unix()
+	mut timed_out := false
+	for p.is_alive() {
+		if time.now().unix() - start > i64(tool_timeout_seconds) {
+			if !timed_out {
+				timed_out = true
+				p.signal_term()
+				time.sleep(3 * time.second)
+				if p.is_alive() {
+					p.signal_kill()
+				}
+			}
+		}
+		time.sleep(500 * time.millisecond)
+	}
+	p.wait() // reaps the (exited) child and sets p.code
 	stdout := p.stdout_slurp()
 	stderr := p.stderr_slurp()
 	exit_code := p.code
@@ -53,9 +75,13 @@ fn run_v_tool(args []string) mcp.ToolResult {
 		out += if out.len > 0 { '\n' } else { '' } + stderr
 	}
 	out = out.trim_space()
-	if exit_code != 0 {
+	if exit_code != 0 || timed_out {
 		if out.len == 0 {
-			out = 'command failed with exit code ${exit_code}'
+			if timed_out {
+				out = 'command timed out after ${tool_timeout_seconds} s'
+			} else {
+				out = 'command failed with exit code ${exit_code}'
+			}
 		}
 		return to_error_result(out)
 	}
