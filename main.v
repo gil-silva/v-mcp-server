@@ -2,8 +2,9 @@
 // An MCP (Model Context Protocol) server that exposes V development tooling
 // to coding agents: program compilation and execution, structured build
 // errors, test runs, formatting checks (verify and in-place fix), vet
-// warnings, AST dumps, symbol outlines, module docs (v_doc), repo briefs,
-// v.mod inspection, affected-test selection, who-uses-what queries (definitions, callers,
+// warnings, AST dumps, symbol outlines, one-symbol source slices (v_read),
+// module docs (v_doc), repo briefs, v.mod inspection and a v.mod project
+// lookup (v_where), affected-test selection, who-uses-what queries (definitions, callers,
 // interface implementations) and a server build/info report.
 //
 // Built on the official `mcp` module of the V standard library; serves
@@ -15,13 +16,14 @@ import mcp
 import json2
 import os
 import time
+import crypto.sha256
 import gil_silva.vrepo.vrepo
 import gil_silva.vaffected.vaffected
 import gil_silva.vuses.vuses
 
 const server_name = 'v-mcp-server'
 
-const server_version = '0.6.0'
+const server_version = '0.7.0'
 
 // output_byte_limit caps any tool output, so agents never choke on
 // multi-megabyte AST dumps or test logs.
@@ -53,15 +55,25 @@ const v_build_schema = '{"type":"object","properties":{"path":{"description":"Ab
 // enforcing the `path`-property invariant of every other tool.
 const server_info_schema = '{"type":"object","properties":{},"additionalProperties":false}'
 
-// v_test_schema declares path as required and only as an optional glob that
-// selects which test functions run, forwarded via the VTEST_ONLY_FN
-// environment variable (through env(1)); `path` must stay the first property
+// v_test_schema declares path as required, only as an optional glob that
+// selects which test functions run (forwarded via the VTEST_ONLY_FN
+// environment variable through env(1)), and stats as an optional boolean
+// switching to structured per-test rows; `path` must stay the first property
 // — smoke.vsh counts `"properties":{"path":{` occurrences server-wide.
-const v_test_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V test file or project directory","type":"string"},"only":{"description":"VTEST_ONLY_FN glob: run only test functions whose name matches (optional string, e.g. \\"*handshake*\\")","type":"string"}},"required":["path"],"additionalProperties":false}'
+const v_test_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V test file or project directory","type":"string"},"only":{"description":"VTEST_ONLY_FN glob: run only test functions whose name matches (optional string, e.g. \\"*handshake*\\")","type":"string"},"stats":{"description":"Return structured per-test rows [{file,name,ok,ms,asserts}] instead of raw output (optional boolean); the raw output trails the rows as failure detail when tests fail","type":"boolean"}},"required":["path"],"additionalProperties":false}'
 
 // v_uses_schema declares path as required and symbol as an optional string
 // the tool itself validates; same `path`-first rule as every other schema.
 const v_uses_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V project directory to scan","type":"string"},"symbol":{"description":"The declared V symbol name to query (fn/method/struct/interface/enum/const/type name)","type":"string"}},"required":["path"],"additionalProperties":false}'
+
+// v_read_schema declares the .v file (path) as required; symbol is validated
+// by the tool itself; same `path`-first rule as every other schema.
+const v_read_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a single .v source file","type":"string"},"symbol":{"description":"The declared symbol to return verbatim (fn/method/struct/interface/enum/const/type name, e.g. run_capture)","type":"string"}},"required":["path"],"additionalProperties":false}'
+
+// v_where_schema declares path as the directory to scan for v.mod projects.
+// `path` must stay the first property — smoke.vsh counts
+// `"properties":{"path":{` occurrences server-wide.
+const v_where_schema = '{"type":"object","properties":{"path":{"description":"Absolute directory to scan for V projects (folders containing a v.mod); scanned a few levels deep","type":"string"}},"required":["path"],"additionalProperties":false}'
 
 // PathArgs is the common `arguments` payload of the tools below:
 // a path to a single .v file or a project directory.
@@ -69,10 +81,12 @@ struct PathArgs {
 	path string
 }
 
-// TestArgs is the payload of v_test: a path plus an optional VTEST_ONLY glob.
+// TestArgs is the payload of v_test: a path, an optional VTEST_ONLY glob and
+// an optional switch to the structured (-stats) report.
 struct TestArgs {
-	path string
-	only ?string
+	path  string
+	only  ?string
+	stats ?bool
 }
 
 // BuildArgs is the payload of v_build: a path plus optional CLI flags
@@ -116,6 +130,13 @@ struct UsesArgs {
 	symbol string
 }
 
+// ReadArgs is the payload of v_read: a single .v file (path) plus the
+// declared symbol name to return verbatim. An empty symbol is a tool error.
+struct ReadArgs {
+	path   string
+	symbol string
+}
+
 // decode_args parses a tool `arguments` JSON into T.
 fn decode_args[T](arguments string) !T {
 	return json2.decode[T](arguments, json2.DecoderOptions{})!
@@ -132,6 +153,45 @@ fn validate_path(path string) ! {
 	}
 	if !os.exists(path) {
 		return error('path does not exist: ${path}')
+	}
+}
+
+// only_allowed_chars lists the characters a VTEST_ONLY_FN glob may contain:
+// word characters (test fn names) plus the glob metacharacters * ? [] and -
+// (a valid trailing range character). Spaces and quotes stay out by design —
+// the string travels verbatim through env(1) as VAR=value text.
+const only_allowed_chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.*?[]-'
+
+// validate_only rejects a test-function glob that carries characters no test
+// name or glob needs, before it ever reaches env(1).
+fn validate_only(glob string) ! {
+	allowed := only_allowed_chars.bytes()
+	for b in glob.bytes() {
+		if b !in allowed {
+			return error('only: unsupported character "${b.ascii_str()}"; test names are word characters and globs may use * ? [ ] -')
+		}
+	}
+}
+
+// validate_vflags checks the argv shape of forwarded compiler flags: every
+// element starts with '-' (an option) or is the single value right after an
+// option (`-cc clang`). A non-dash element in any other slot — usually a
+// source path that belongs in `path` — is rejected with a clear message
+// instead of quietly compiling the wrong files.
+fn validate_vflags(flags []string) ! {
+	mut prev_was_flag := false
+	for i, flag in flags {
+		if flag.len == 0 {
+			return error('vflags[${i}] is an empty string')
+		}
+		if flag.starts_with('-') {
+			prev_was_flag = true
+		} else {
+			if !prev_was_flag {
+				return error('vflags[${i}] ("${flag}") does not start with "-": pass sources through "path" and options as flags (e.g. ["-cc","clang"])')
+			}
+			prev_was_flag = false
+		}
 	}
 }
 
@@ -258,6 +318,252 @@ fn compile_args(bin string, path string, flags []string) []string {
 	return cargs
 }
 
+// ---- warm build cache -------------------------------------------------------
+//
+// The agent edit loop compiles the same tree over and over (v_errors,
+// v_build, v_run chain on identical sources). Each cache entry stores the
+// raw facts of one compile — merged streams, success flag, a fallback
+// summary for silent failures — in result.json, and the freshly linked
+// binary beside it at bin/ when the compile succeeded. Entries are keyed by
+// a hash of the toolchain stamp, the request (real path + vflags) and
+// content hashes of every .v source in scope, so a hit means bytes-for-bytes
+// the same inputs, not just "mtime looks the same".
+
+// Cache bounds: how many entries pruning keeps, how old an entry may get
+// before pruning drops it, and how much of the merged compile output is
+// stored with a record (what an agent sees is still capped by truncate()).
+const cache_keep_entries = 16
+const cache_max_age_hours = 24 * 14
+const cache_max_stored_bytes = 400_000
+
+// CachedBuild is the compile record stored in an entry's result.json (with
+// the executable beside it at bin/) — the raw facts of one build: merged
+// streams, success flag and a fallback summary for silent failures.
+struct CachedBuild {
+pub:
+	ok      bool
+	text    string
+	summary string
+}
+
+// BuildOutcome is the shared compile step result: the record (from the cache
+// on a hit) plus the executable path to run, empty when none exists.
+struct BuildOutcome {
+pub:
+	ok       bool
+	text     string
+	summary  string
+	hit      bool
+	bin_path string
+}
+
+// cache_dir returns the machine-local cache root, created on demand.
+fn cache_dir() string {
+	dir := os.join_path(os.temp_dir(), 'mcp_vlang_cache')
+	os.mkdir(dir) or {} // exists is the normal case
+	return dir
+}
+
+// refresh_toolchain_stamp records `v -version` in the cache dir. Cache keys
+// fold this stamp in, so upgrading the toolchain invalidates stale entries;
+// one cheap spawn per server start.
+fn refresh_toolchain_stamp() {
+	c := run_capture(['v', '-version'])
+	if c.timed_out || c.exit_code != 0 {
+		return
+	}
+	os.write_file(os.join_path(cache_dir(), 'toolchain.txt'), c.stdout.trim_space()) or {}
+}
+
+// toolchain_stamp reads the recorded version (an empty string when the
+// startup probe never wrote it).
+fn toolchain_stamp() string {
+	return os.read_file(os.join_path(cache_dir(), 'toolchain.txt')) or { '' }
+}
+
+// build_cache_key hashes the full build identity: toolchain stamp, realpath
+// and vflags of the request, plus content hashes of the .v sources in scope
+// (the whole tree under a directory target; a single file target by itself)
+// and the v.mod beside them (it names the dependencies). Content hashes, not
+// mtimes, decide hits: a touched-but-unchanged tree can hit, a rewritten
+// same-size file cannot. Unreadable pieces are skipped rather than invented;
+// an empty key — unreadable target, or a path that is neither a .v file nor
+// a directory — means the caller compiles without the cache.
+fn build_cache_key(path string, flags []string) string {
+	mut manifest := []string{}
+	manifest << 'toolchain:\x1f${toolchain_stamp()}'
+	manifest << 'path:\x1f${os.real_path(path)}'
+	if flags.len > 0 {
+		manifest << 'vflags:\x1f${flags.join('\x1f')}'
+	}
+	if os.is_dir(path) {
+		collect_source_rows(path, '', mut manifest)
+	} else if path.ends_with('.v') {
+		src := os.read_file(path) or { return '' }
+		manifest << '${os.file_name(path)}\x1f${sha256.sum(src.bytes()).hex()[..16]}'
+	} else {
+		return ''
+	}
+	root := if os.is_dir(path) { path } else { os.dir(path) }
+	vmod := os.read_file(os.join_path(root, 'v.mod')) or { '' }
+	if vmod.len > 0 {
+		manifest << 'v.mod\x1f${sha256.sum(vmod.bytes()).hex()[..16]}'
+	}
+	return sha256.sum(manifest.join('\n').bytes()).hex()
+}
+
+// collect_source_rows appends `relpath\x1fhash16` rows for every .v file
+// under dir, recursion in sorted order for determinism; hidden directories
+// (a .git worktree can hold stale sources) and node_modules trees are
+// skipped, consistent with v_where.
+fn collect_source_rows(dir string, prefix string, mut rows []string) {
+	mut entries := os.ls(dir) or { return }
+	entries.sort()
+	for entry in entries {
+		full := os.join_path(dir, entry)
+		if os.is_dir(full) {
+			if entry.starts_with('.') || entry == 'node_modules' {
+				continue
+			}
+			collect_source_rows(full, join_rel(prefix, entry), mut rows)
+		} else if entry.ends_with('.v') {
+			src := os.read_file(full) or {
+				rows << '${join_rel(prefix, entry)}\x1funreadable'
+				continue
+			}
+			rows << '${join_rel(prefix, entry)}\x1f${sha256.sum(src.bytes()).hex()[..16]}'
+		}
+	}
+}
+
+// join_rel builds a `src/main.v` relative name from a walker prefix and entry.
+fn join_rel(prefix string, entry string) string {
+	return if prefix == '' { entry } else { '${prefix}/${entry}' }
+}
+
+// cache_load returns the stored record for key, or none when absent/bad.
+fn cache_load(key string) ?CachedBuild {
+	if key == '' {
+		return none
+	}
+	data := os.read_file(os.join_path(cache_dir(), key, 'result.json')) or { return none }
+	return json2.decode[CachedBuild](data, json2.DecoderOptions{}) or { none }
+}
+
+// cache_save writes the record for key into its entry dir; a non-empty bin
+// path is moved under the entry as the reusable executable.
+fn cache_save(key string, record CachedBuild, bin string) {
+	if key == '' {
+		return
+	}
+	entry := os.join_path(cache_dir(), key)
+	os.mkdir_all(entry) or { return }
+	os.write_file(os.join_path(entry, 'result.json'), json2.encode(record)) or { return }
+	if bin != '' && os.exists(bin) {
+		os.mv(bin, os.join_path(entry, 'bin')) or { return }
+	}
+}
+
+// prune_cache bounds the entry count: everything older than the age cap is
+// dropped, then all but the newest cache_keep_entries. Runs once from main
+// before the stdio loop starts.
+fn prune_cache() {
+	entries := os.ls(cache_dir()) or { return }
+	stamp := time.now().unix() - i64(cache_max_age_hours) * time.hour
+	mut by_mtime := []string{}
+	for entry in entries {
+		if entry == 'toolchain.txt' {
+			continue
+		}
+		full := os.join_path(cache_dir(), entry)
+		if !os.is_dir(full) {
+			continue
+		}
+		filestat := os.stat(full) or { continue }
+		if filestat.mtime < stamp {
+			os.rmdir_all(full) or {}
+			continue
+		}
+		// zero-padded mtime first ⇒ plain string sorting orders oldest first
+		by_mtime << '${filestat.mtime:020}\x1f${entry}'
+	}
+	if by_mtime.len <= cache_keep_entries {
+		return
+	}
+	by_mtime.sort()
+	oldest := by_mtime[0..by_mtime.len - cache_keep_entries].clone()
+	for row in oldest {
+		entry_name := row.after('\x1f')
+		if entry_name.len > 0 {
+			os.rmdir_all(os.join_path(cache_dir(), entry_name)) or {}
+		}
+	}
+}
+
+// build_with_cache is the compile step with the warm cache in front: on a
+// key hit the stored record (and binary, when stored) is replayed and no v
+// process runs; on a miss it compiles to a temp output and stores the
+// record. An empty key (out-of-scope target) skips both cache and save.
+fn build_with_cache(path string, flags []string) BuildOutcome {
+	key := build_cache_key(path, flags)
+	if key != '' {
+		if rec := cache_load(key) {
+			entry_bin := os.join_path(cache_dir(), key, 'bin')
+			return BuildOutcome{
+				ok:       rec.ok
+				text:     rec.text
+				summary:  rec.summary
+				hit:      true
+				bin_path: if os.is_file(entry_bin) { entry_bin } else { '' }
+			}
+		}
+	}
+	return compile_and_store(path, flags, key)
+}
+
+// compile_and_store is the miss path: run v against a temp output, fold the
+// capture into a record (text capped, with a summary for stream-empty
+// failures), store it under key when there is one, and return the facts —
+// with the freshly built binary to execute when the compile succeeded.
+fn compile_and_store(path string, flags []string, key string) BuildOutcome {
+	tmp := tmp_output_path('cache_target')
+	compile := run_capture(compile_args(tmp, path, flags))
+	ok := compile.exit_code == 0 && !compile.timed_out
+	text := merge_streams(compile.stdout, compile.stderr)
+	summary := if compile.timed_out {
+		'command timed out after ${tool_timeout_seconds} s'
+	} else if compile.exit_code != 0 {
+		'command failed with exit code ${compile.exit_code}'
+	} else {
+		''
+	}
+	record := CachedBuild{
+		ok:      ok
+		text:    if text.len > cache_max_stored_bytes { truncate(text) } else { text }
+		summary: summary
+	}
+	if key != '' {
+		cache_save(key, record, if ok { os.real_path(tmp) } else { '' })
+	}
+	// the saved move puts the binary in the entry (and keeps it running for
+	// this call too); with no entry — empty key or a failed move — the temp
+	// output is the executable
+	mut bin_path := if ok && os.is_file(tmp) { tmp } else { '' }
+	if ok && key != '' {
+		entry_bin := os.join_path(cache_dir(), key, 'bin')
+		if os.is_file(entry_bin) {
+			bin_path = entry_bin
+		}
+	}
+	return BuildOutcome{
+		ok:       ok
+		text:     record.text
+		summary:  record.summary
+		hit:      false
+		bin_path: bin_path
+	}
+}
+
 // ---- tools -----------------------------------------------------------------
 
 fn v_build_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
@@ -268,11 +574,18 @@ fn v_build_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
 	flags := a.vflags or { []string{} }
-	checkout := tmp_output_path('build')
-	defer {
-		os.rm(checkout) or {}
+	validate_vflags(flags) or {
+		return to_error_result('bad arguments: ${err.msg()}')
 	}
-	return run_v_tool(compile_args(checkout, a.path, flags))
+	// The run_v_tool text contract, rebuilt from the record: failures carry
+	// what the compiler printed (or the summary when it printed nothing);
+	// successes report 'ok'.
+	outcome := build_with_cache(a.path, flags)
+	if !outcome.ok {
+		return to_error_result(if outcome.text.len == 0 { outcome.summary } else { outcome.text })
+	}
+	out := if outcome.text.len == 0 { 'ok (exit 0, no output)' } else { outcome.text }
+	return mcp.tool_text_result(truncate(out))
 }
 
 // ---- v_run: compile once, then execute the binary ---------------------------
@@ -284,36 +597,30 @@ fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	validate_path(a.path) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
-	bin := tmp_output_path('run_target')
-	defer {
-		os.rm(bin) or {}
-	}
 
 	// Same failure contract as run_v_tool: an error result carrying whatever
-	// the compiler printed (or a fallback line when it printed nothing).
+	// the compiler printed (or a fallback line when it printed nothing). The
+	// warm cache may hold a build for these exact sources — then the stored
+	// binary runs immediately and no compiler output section appears.
 	flags := a.vflags or { []string{} }
-	compile := run_capture(compile_args(bin, a.path, flags))
-	mut build_log := merge_streams(compile.stdout, compile.stderr)
-	if compile.exit_code != 0 || compile.timed_out {
-		if build_log.len == 0 {
-			build_log = if compile.timed_out {
-				'build timed out after ${tool_timeout_seconds} s'
-			} else {
-				'build failed with exit code ${compile.exit_code}'
-			}
-		}
+	validate_vflags(flags) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	outcome := build_with_cache(a.path, flags)
+	if !outcome.ok {
+		build_log := if outcome.text.len == 0 { outcome.summary } else { outcome.text }
 		return to_error_result('v_run build failed:\n${build_log}')
 	}
 
 	args := a.args or { []string{} }
 	mut pargs := []string{cap: args.len + 1}
-	pargs << bin
+	pargs << outcome.bin_path
 	pargs << args
 
 	prog := run_capture(pargs)
 	mut parts := []string{}
-	if build_log.len > 0 {
-		parts << 'compiler output:\n${build_log}'
+	if outcome.text.len > 0 {
+		parts << 'compiler output:\n${outcome.text}'
 	}
 	if prog.stdout.len > 0 {
 		parts << 'program stdout:\n${prog.stdout.trim_space()}'
@@ -344,23 +651,17 @@ fn v_errors_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	validate_path(a.path) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
-	bin := tmp_output_path('errors_target')
-	defer {
-		os.rm(bin) or {}
-	}
 	flags := a.vflags or { []string{} }
-	compile := run_capture(compile_args(bin, a.path, flags))
-	text := merge_streams(compile.stdout, compile.stderr)
-	diags := parse_diagnostics(text)
-	if diags.len == 0 && (compile.exit_code != 0 || compile.timed_out) {
+	validate_vflags(flags) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	outcome := build_with_cache(a.path, flags)
+	diags := parse_diagnostics(outcome.text)
+	if diags.len == 0 && !outcome.ok {
 		// Failed without parseable output; surface it raw instead of letting
 		// `[]` pass as "clean build".
-		fallback := if compile.timed_out {
-			'build timed out after ${tool_timeout_seconds} s'
-		} else {
-			'build failed (exit ${compile.exit_code}) with no parseable diagnostics'
-		}
-		return to_error_result('v_errors: ${fallback}:\n${truncate(text)}')
+		fallback := if outcome.summary.len > 0 { outcome.summary } else { outcome.text }
+		return to_error_result('v_errors: ${fallback}:\n${truncate(outcome.text)}')
 	}
 	body := json2.encode(diags)
 	return mcp.tool_text_result(truncate(body))
@@ -419,6 +720,75 @@ fn diagnostic_kind(word string) string {
 	}
 }
 
+// TestRow is one parsed `v -stats test` result line, attributed to the file
+// the row's `running tests in:` cue set.
+struct TestRow {
+pub:
+	file    string
+	name    string
+	ok      bool
+	ms      f64
+	asserts int
+}
+
+// parse_test_rows extracts one row per test result from `v -stats test`
+// output. File attribution comes from the `running tests in:` cues; result
+// lines are shaped `     OK    [1/2]     0.000 ms     1 assert | mod.fn()`
+// (FAIL counts the same). Unrelated lines pass by; a result line whose shape
+// does not fit yields no row, and no rows at all means the caller falls back
+// to the raw output.
+fn parse_test_rows(text string) []TestRow {
+	mut rows := []TestRow{}
+	mut file := ''
+	for raw_line in text.split_into_lines() {
+		line := raw_line.trim_space()
+		if line.starts_with('running tests in: ') {
+			file = line.after('running tests in: ').trim_space()
+			continue
+		}
+		mut kind := ''
+		if line.starts_with('OK ') {
+			kind = 'OK'
+		} else if line.starts_with('FAIL ') {
+			kind = 'FAIL'
+		}
+		if kind == '' {
+			continue
+		}
+		// `fields | mod.fn_name()` — the left side is `[N/M] <ms> ms <n> assert`
+		// (fields named exactly that), the right side names the test
+		sep := line.index(' | ') or { continue }
+		fields := line[..sep].trim_space().fields()
+		tail := line[sep + 3..].trim_space()
+		if fields.len < 6 || !fields[1].starts_with('[') || fields[3] != 'ms' {
+			continue
+		}
+		if !tail.ends_with('()') || !tail.contains('.') {
+			continue
+		}
+		rows << TestRow{
+			file:    file
+			name:    tail[..tail.len - 2]
+			ok:      kind == 'OK'
+			ms:      fields[2].f64()
+			asserts: fields[4].int()
+		}
+	}
+	return rows
+}
+
+// test_report renders the structured v_test view: a one-line count, one JSON
+// row per test result, and the raw -stats output as failure detail whenever
+// anything failed.
+fn test_report(rows []TestRow, raw string) string {
+	passed := rows.filter(it.ok).len
+	mut out := 'tests: ${passed}/${rows.len} passed\n' + json2.encode(rows)
+	if passed < rows.len {
+		out += '\n\nfailure detail:\n' + raw.trim_space()
+	}
+	return out
+}
+
 fn v_test_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	a := decode_args[TestArgs](arguments) or {
 		return to_error_result('bad arguments: ${err.msg()}')
@@ -427,15 +797,60 @@ fn v_test_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
 	only := a.only or { '' }.trim_space()
-	if only.len == 0 {
-		return run_v_tool(['v', '-no-parallel', 'test', a.path])
+	if only.len > 0 {
+		// VTEST_ONLY_FN selects test functions through the environment, but
+		// os.Process.set_environment *replaces* the child environment outright
+		// (PATH, HOME and friends would vanish) — so forward through env(1),
+		// which appends to the inherited environment instead. (VTEST_ONLY
+		// filters file paths; VTEST_ONLY_FN filters test function names.)
+		validate_only(only) or {
+			return to_error_result('bad arguments: ${err.msg()}')
+		}
 	}
-	// VTEST_ONLY_FN selects test functions through the environment, but
-	// os.Process.set_environment *replaces* the child environment outright
-	// (PATH, HOME and friends would vanish) — so forward through env(1),
-	// which appends to the inherited environment instead. (VTEST_ONLY
-	// filters file paths; VTEST_ONLY_FN filters test function names.)
-	return run_v_tool(['env', 'VTEST_ONLY_FN=${only}', 'v', '-no-parallel', 'test', a.path])
+	stats := a.stats or { false }
+	if !stats {
+		if only.len == 0 {
+			// this server may itself be running under a `v test` harness
+			// whose VTEST_ONLY_FN is narrowed to suite-internal globs; left
+			// inherited, it silently excludes every test, so env(1) -u
+			// clears it for plain runs
+			return run_v_tool(['env', '-u', 'VTEST_ONLY_FN', 'v', '-no-parallel', 'test', a.path])
+		}
+		return run_v_tool(['env', 'VTEST_ONLY_FN=${only}', 'v', '-no-parallel', 'test', a.path])
+	}
+	// structured mode: `-stats` output parses into one row per test result;
+	// same VTEST_ONLY_FN hygiene as the plain branch above
+	mut cmd := []string{cap: 8}
+	cmd << 'env'
+	if only.len > 0 {
+		cmd << 'VTEST_ONLY_FN=${only}'
+	} else {
+		cmd << '-u'
+		cmd << 'VTEST_ONLY_FN'
+	}
+	cmd << 'v'
+	cmd << '-stats'
+	cmd << '-no-parallel'
+	cmd << 'test'
+	cmd << a.path
+	c := run_capture(cmd)
+	text := merge_streams(c.stdout, c.stderr)
+	rows := parse_test_rows(text)
+	if rows.len == 0 {
+		// nothing parseable: probe compilation failed, suite never ran, or
+		// the -stats shape changed — fall back to the raw view (plus a
+		// timeout note when the run hit the process cap)
+		if c.exit_code != 0 || c.timed_out {
+			fallback := if c.timed_out {
+				'test run timed out after ${tool_timeout_seconds} s'
+			} else {
+				text
+			}
+			return to_error_result('v_test: exit ${c.exit_code}, no parseable rows:\n${fallback}')
+		}
+		return mcp.tool_text_result(truncate(text))
+	}
+	return mcp.tool_text_result(truncate(test_report(rows, text)))
 }
 
 fn v_fmt_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
@@ -574,6 +989,84 @@ fn v_symbols_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	return mcp.tool_text_result('line\tkind\tname\n' + b.join('\n'))
 }
 
+// SymbolSource is a v_read slice: the verbatim text and its 1-based line
+// range inside the source file.
+struct SymbolSource {
+	text string
+	from int
+	to   int
+}
+
+// symbol_source returns the verbatim source of one declared symbol (a
+// top-level fn/method/struct/interface/enum/const/type in a .v file): from
+// its header — including the doc comment block directly above it — to just
+// before the next declaration, whose own comment block and the blank lines
+// separating sections are trimmed back off.
+fn symbol_source(path string, symbol string) !SymbolSource {
+	syms := symbols_from_file(path)
+	matches := syms.filter(it.name == symbol)
+	if matches.len == 0 {
+		return error('no symbol named "${symbol}" in ${path} (declared: ${syms.map(it.name).join(', ')})')
+	}
+	target := matches[0]
+	content := os.read_file(path)!
+	lines := content.split_into_lines()
+	start_idx := target.line - 1
+	if start_idx >= lines.len {
+		return error('symbol line ${target.line} is out of range for ${path}')
+	}
+	mut first_idx := start_idx
+	// the target's own doc comment block belongs to it
+	for first_idx > 0 && lines[first_idx - 1].trim_space().starts_with('//') {
+		first_idx--
+	}
+	// the span runs to just before the next declaration (syms are scan-ordered)
+	mut end_idx := lines.len - 1
+	for next_decl in syms {
+		if next_decl.line > target.line {
+			end_idx = next_decl.line - 2
+			break
+		}
+	}
+	if end_idx < first_idx {
+		end_idx = first_idx
+	}
+	// the next declaration's doc comments are its own, not part of this span
+	for end_idx > start_idx {
+		tail := lines[end_idx].trim_space()
+		if tail == '' || tail.starts_with('//') {
+			end_idx--
+		} else {
+			break
+		}
+	}
+	return SymbolSource{
+		text: lines[first_idx..end_idx + 1].join('\n')
+		from: first_idx + 1
+		to:   end_idx + 1
+	}
+}
+
+// v_read_tool returns the exact source text of one symbol from a .v file —
+// a pinpoint read next to v_symbols, so an agent editing a function in a
+// long file never has to load the whole thing.
+fn v_read_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[ReadArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	validate_path(a.path) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	symbol := a.symbol.trim_space()
+	if symbol.len == 0 {
+		return to_error_result('v_read: the "symbol" argument is required (a name from the v_symbols outline)')
+	}
+	slice := symbol_source(a.path, symbol) or {
+		return to_error_result('v_read: ${err.msg()}')
+	}
+	return mcp.tool_text_result(truncate('${a.path}:${slice.from}-${slice.to}\n${slice.text}'))
+}
+
 // ---- v_doc: generated module docs --------------------------------------------
 
 // v_doc_tool documents a module: the `v doc` output for a module directory
@@ -590,17 +1083,12 @@ fn v_doc_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 
 // ---- v_deps: read a project's v.mod -----------------------------------------
 
-fn v_deps_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
-	a := decode_args[PathArgs](arguments) or {
-		return to_error_result('bad arguments: ${err.msg()}')
-	}
-	validate_path(a.path) or {
-		return to_error_result('bad arguments: ${err.msg()}')
-	}
-	vmod := os.join_path(a.path, 'v.mod')
-	content := os.read_file(vmod) or {
-		return to_error_result('no v.mod in ${a.path}: ${err.msg()}')
-	}
+// v_mod_summary returns the name/version/license/dependencies fields read
+// from a project directory's v.mod — the parsing v_deps reports, extracted
+// here so v_where can reuse it.
+fn v_mod_summary(dir string) !string {
+	vmod := os.join_path(dir, 'v.mod')
+	content := os.read_file(vmod)!
 	// A multiline `dependencies: [...]` leaks into continuation lines, so the
 	// dependencies field streams until its closing bracket instead of
 	// matching just the four well-known prefixes.
@@ -627,7 +1115,76 @@ fn v_deps_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 			i++
 		}
 	}
-	return mcp.tool_text_result(fields.join('\n'))
+	return fields.join('\n')
+}
+
+fn v_deps_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[PathArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	validate_path(a.path) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	return mcp.tool_text_result(v_mod_summary(a.path) or {
+		return to_error_result('no v.mod in ${a.path}: ${err.msg()}')
+	})
+}
+
+// ---- v_where: find every v.mod project below a directory --------------------
+
+// v_where_depth bounds how deep v_where recurses looking for v.mod files.
+const v_where_depth = 4
+
+// find_v_projects appends every directory under dir (dir itself included)
+// holding a v.mod, recursing at most v_where_depth levels and skipping
+// hidden directories (e.g. .git) and vendored node_modules trees.
+fn find_v_projects(dir string, depth int, mut found []string) {
+	if depth > v_where_depth {
+		return
+	}
+	if os.exists(os.join_path(dir, 'v.mod')) {
+		found << dir
+	}
+	mut entries := os.ls(dir) or { return }
+	entries.sort()
+	for entry in entries {
+		full := os.join_path(dir, entry)
+		if entry.starts_with('.') || entry == 'node_modules' || !os.is_dir(full) {
+			continue
+		}
+		find_v_projects(full, depth + 1, mut found)
+	}
+}
+
+// v_where_tool reports every V project (a folder holding a v.mod) under a
+// directory (path), each with its v.mod identity — the bootstrap answer for
+// agents that sit at a workspace root full of projects while every other
+// tool demands an absolute project path.
+fn v_where_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[PathArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	validate_path(a.path) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	if !os.is_dir(a.path) {
+		return to_error_result('v_where: path must be a directory to scan (got ${a.path})')
+	}
+	mut projects := []string{}
+	find_v_projects(a.path, 0, mut projects)
+	if projects.len == 0 {
+		return mcp.tool_text_result('no v.mod projects under ${a.path} (depth ${v_where_depth})')
+	}
+	mut rows := []string{}
+	for dir in projects {
+		summary := v_mod_summary(dir) or { '' }
+		if summary.len == 0 {
+			rows << '${dir} — (v.mod unreadable)'
+			continue
+		}
+		rows << '${dir} — ${summary.trim_space().replace('\n', ' ')}'
+	}
+	return mcp.tool_text_result(truncate(rows.join('\n')))
 }
 
 // ---- v_repo_brief: a compact repo map via the vrepo library ------------------
@@ -720,7 +1277,7 @@ fn new_vlang_server() !mcp.Server {
 	mut server := mcp.new_server(
 		name:         server_name
 		version:      server_version
-		instructions: 'V development server: compile, test (with a test-function glob only=…), format-check and format in place, vet, dump AST JSON, outline symbols, document a module, inspect v.mod, brief a repo, run only affected tests, run a compiled program, list compiler diagnostics as JSON, answer who-uses-what, and report its own build (v_server_info). PASS ABSOLUTE PATHS.'
+		instructions: "V development server: compile, test (with a test-function glob only=…), format-check and format in place, vet, dump AST JSON, outline symbols, read one symbol's source (v_read), document a module, inspect v.mod, look up v.mod projects under a directory (v_where), brief a repo, run only affected tests, run a compiled program, list compiler diagnostics as JSON, answer who-uses-what, and report its own build (v_server_info). PASS ABSOLUTE PATHS."
 	)
 	server.add_tool(mcp.Tool{
 		name:         'v_build'
@@ -739,7 +1296,7 @@ fn new_vlang_server() !mcp.Server {
 	}, v_errors_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_test'
-		description:  'Run `v test` on a file or project (path). Optional only (string) is a VTEST_ONLY_FN glob forwarded via env(1) — run only test functions whose name matches, e.g. "*handshake*".'
+		description:  'Run `v test` on a file or project (path). Optional only (string) is a VTEST_ONLY_FN glob forwarded via env(1) — run only test functions whose name matches, e.g. "*handshake*". Optional stats (boolean) returns structured rows [{file,name,ok,ms,asserts}] with the raw output as failure detail; unparsable runs fall back to the raw view.'
 		input_schema: v_test_schema
 	}, v_test_tool)!
 	server.add_tool(mcp.Tool{
@@ -793,6 +1350,16 @@ fn new_vlang_server() !mcp.Server {
 		input_schema: v_uses_schema
 	}, v_uses_tool)!
 	server.add_tool(mcp.Tool{
+		name:         'v_read'
+		description:  'Return the exact source text of one declared symbol (path = a .v file, symbol = its name, e.g. "run_capture"): from its header to just before the next declaration, with its range in the file. Pair with v_symbols for pinpoint edits without reading whole files.'
+		input_schema: v_read_schema
+	}, v_read_tool)!
+	server.add_tool(mcp.Tool{
+		name:         'v_where'
+		description:  'List every V project (a folder holding a v.mod) under directory path, up to a few levels deep — each with its v.mod name/version/license/dependencies, paths absolute and tool-ready.'
+		input_schema: v_where_schema
+	}, v_where_tool)!
+	server.add_tool(mcp.Tool{
 		name:         'v_server_info'
 		description:  'Report the running server build: name, version, compile-time build timestamp and the underlying `v -version`. No arguments. Use this to spot a stale binary/connection.'
 		input_schema: server_info_schema
@@ -803,6 +1370,10 @@ fn new_vlang_server() !mcp.Server {
 // main runs the MCP server over stdin/stdout (newline-delimited JSON-RPC).
 // All logs go to stderr; stdout is reserved for the protocol.
 fn main() {
+	// one-time cache housekeeping: stamp the toolchain version (cache keys
+	// depend on it) and bound the entry store
+	refresh_toolchain_stamp()
+	prune_cache()
 	mut server := new_vlang_server() or {
 		eprintln('${server_name}: failed to build server: ${err.msg()}')
 		exit(1)

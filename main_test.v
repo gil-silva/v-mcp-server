@@ -69,6 +69,8 @@ fn test_compile_and_handshake() {
 	assert names.contains('v_deps'), names.str()
 	assert names.contains('v_repo_brief'), names.str()
 	assert names.contains('v_uses'), names.str()
+	assert names.contains('v_read'), names.str()
+	assert names.contains('v_where'), names.str()
 }
 
 fn test_v_repo_brief_call_round_trip() {
@@ -94,7 +96,7 @@ fn test_v_repo_brief_call_round_trip() {
 		}) or { panic('tools/call: ${err.msg()}') }
 	assert !res.is_error, res.content
 	assert res.content.contains('vrepo brief — '), res.content
-	assert res.content.contains('module: vmcpserver 0.6.0 [MIT]'), res.content
+	assert res.content.contains('module: vmcpserver 0.7.0 [MIT]'), res.content
 	assert res.content.contains('entry points: main.v'), res.content
 }
 
@@ -328,4 +330,340 @@ fn test_v_deps_multiline_round_trip() {
 	assert !res.is_error, res.content
 	assert res.content.contains('example.com/a'), res.content
 	assert res.content.contains('example.com/b'), res.content
+}
+
+fn test_validate_vflags() {
+	// good shapes: bare flags, and an option taking one value after it
+	validate_vflags([]) or { assert false, err.msg() }
+	validate_vflags(['-prod', '-g']) or { assert false, err.msg() }
+	validate_vflags(['-cc', 'clang']) or { assert false, err.msg() }
+	validate_vflags(['--some-flag']) or { assert false, err.msg() }
+	// bad shapes: stray values without their flag, empty strings
+	mut rejected := false
+	validate_vflags(['clang']) or { rejected = true }
+	assert rejected, 'stray value must be rejected'
+	rejected = false
+	validate_vflags(['a.v']) or { rejected = true }
+	assert rejected, 'source path in vflags must be rejected'
+	rejected = false
+	validate_vflags(['-prod', 'clang', 'extra']) or { rejected = true }
+	assert rejected, 'second stray value must be rejected'
+	rejected = false
+	validate_vflags(['-cc', 'clang', 'clang']) or { rejected = true }
+	assert rejected, 'value chains must be rejected'
+	rejected = false
+	validate_vflags(['']) or { rejected = true }
+	assert rejected, 'empty flag must be rejected'
+}
+
+fn test_validate_only() {
+	validate_only('*parse_fn*') or { assert false, err.msg() }
+	validate_only('test_a1-[0-9]*') or { assert false, err.msg() }
+	mut rejected := false
+	validate_only('a space') or { rejected = true }
+	assert rejected, 'spaces must be rejected'
+	rejected = false
+	validate_only('x;y') or { rejected = true }
+	assert rejected, 'stray characters must be rejected'
+}
+
+fn test_symbol_source_slices_and_misses() {
+	path := os.join_path(@VMODROOT, 'main.v')
+	// the slice contains the whole fn and its doc comment, but not the next fn
+	ss := symbol_source(path, 'truncate') or {
+		assert false, 'symbol_source: ${err.msg()}'
+		SymbolSource{}
+	}
+	assert ss.text.contains('fn truncate'), ss.text
+	assert ss.text.contains('// truncate caps'), 'doc comment included'
+	assert !ss.text.contains('fn tmp_output_path'), 'next fn must be excluded'
+	assert ss.from > 0, 'line range'
+	assert ss.to >= ss.from, 'line range ordering'
+	// v_errors spans its comment banner; the previous fn's body stays out
+	ss2 := symbol_source(path, 'v_errors_tool') or {
+		assert false, 'symbol_source: ${err.msg()}'
+		SymbolSource{}
+	}
+	assert ss2.text.contains('fn v_errors_tool'), ss2.text
+	assert !ss2.text.contains('fn v_run_tool'), 'previous fn body excluded'
+	// a missing symbol lists the declared candidates
+	_ = symbol_source(path, 'no_such_symbol_here') or {
+		assert err.msg().contains('no symbol named'), err.msg()
+		SymbolSource{}
+	}
+}
+
+fn test_v_where_v_read_and_argument_validation() {
+	bin := compile_server()
+	defer {
+		os.rm(bin) or {}
+	}
+	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
+		panic('connect_stdio: ${err.msg()}')
+	}
+	defer {
+		client.close()
+	}
+	client.initialize()!
+
+	// v_where: a workspace tree with two projects (one nested) and a hidden
+	// third that must stay out
+	ws := os.join_path(os.temp_dir(), 'v_where_ws_${os.getpid()}')
+	os.rmdir_all(ws) or {}
+	alpha := os.join_path(ws, 'alpha')
+	os.mkdir_all(alpha)!
+	os.write_file(os.join_path(alpha, 'v.mod'), "Module {\n\tname: 'projalpha'\n\tversion: '0.1.0'\n}\n")!
+	beta := os.join_path(ws, 'sub', 'projbeta')
+	os.mkdir_all(beta)!
+	os.write_file(os.join_path(beta, 'v.mod'), "Module {\n\tname: 'projbeta'\n\tversion: '0.2.0'\n}\n")!
+	os.mkdir_all(os.join_path(ws, '.hidden', 'secret'))!
+	os.write_file(os.join_path(ws, '.hidden', 'secret', 'v.mod'), "Module {\n\tname: 'projhidden'\n}\n")!
+	defer {
+		os.rmdir_all(ws) or {}
+	}
+	res := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_where'
+			arguments: {
+				'path': json2.Any(ws)
+			}
+		}) or { panic('tools/call v_where: ${err.msg()}') }
+	assert !res.is_error, res.content
+	assert res.content.contains("name: 'projalpha'"), res.content
+	assert res.content.contains(beta), res.content
+	assert res.content.contains("name: 'projbeta'"), res.content
+	assert !res.content.contains('projhidden'), 'hidden directories are skipped'
+
+	// v_read: a pinpoint slice of truncate (fn + doc comment, range header)
+	res2 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_read'
+			arguments: {
+				'path':   json2.Any('${@VMODROOT}/main.v')
+				'symbol': json2.Any('truncate')
+			}
+		}) or { panic('tools/call v_read: ${err.msg()}') }
+	assert !res2.is_error, res2.content
+	assert res2.content.contains('fn truncate'), res2.content
+	assert res2.content.contains('main.v:'), 'range header in ${res2.content}'
+	assert res2.content.contains('agents chunk better than they download'), res2.content
+	assert !res2.content.contains('fn tmp_output_path'), res2.content
+
+	// invalid vflags only: a clear argument error, not a compile attempt
+	res3 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_build'
+			arguments: {
+				'path':   json2.Any('${@VMODROOT}/main.v')
+				'vflags': json2.Any(['stray.v'])
+			}
+		}) or { panic('tools/call v_build bad vflags: ${err.msg()}') }
+	assert res3.is_error, res3.content
+	assert res3.content.contains('bad arguments: vflags[0]'), res3.content
+
+	// invalid only: rejected before env(1) ever sees it
+	res4 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_test'
+			arguments: {
+				'path': json2.Any(ws)
+				'only': json2.Any('x y')
+			}
+		}) or { panic('tools/call v_test bad only: ${err.msg()}') }
+	assert res4.is_error, res4.content
+	assert res4.content.contains('bad arguments: only:'), res4.content
+
+	// v_read with a missing symbol lists what IS declared
+	res5 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_read'
+			arguments: {
+				'path':   json2.Any('${@VMODROOT}/main.v')
+				'symbol': json2.Any('no_such_symbol_here')
+			}
+		}) or { panic('tools/call v_read missing: ${err.msg()}') }
+	assert res5.is_error, res5.content
+	assert res5.content.contains('no symbol named'), res5.content
+}
+
+fn test_parse_test_rows() {
+	sample := '---- Testing... ----------------------------------------------------------------\n' +
+		'running tests in: /tmp/probe/main_test.v\n' +
+		'     OK    [1/2]     0.001 ms     1 assert | main.test_add_ok()\n' +
+		'     FAIL  [2/2]     0.017 ms     1 assert | main.test_add_fail()\n' +
+		'     Summary for running V tests in "main_test.v": 1 failed, 1 passed, 2 total.\n'
+	rows := parse_test_rows(sample)
+	assert rows.len == 2, '${rows.len} rows'
+	assert rows[0].name == 'main.test_add_ok', rows[0].name
+	assert rows[0].ok
+	assert rows[0].file == '/tmp/probe/main_test.v', rows[0].file
+	assert rows[1].name == 'main.test_add_fail', rows[1].name
+	assert !rows[1].ok
+	assert rows[1].ms > 0.01, '${rows[1].ms} ms'
+	// all-passing report: rows only, no detail section
+	assert !test_report([rows[0]], 'raw').contains('failure detail')
+	assert test_report([rows[1]], 'boom detail').contains('failure detail:\nboom detail')
+}
+
+fn test_v_test_stats_round_trip() {
+	bin := compile_server()
+	defer {
+		os.rm(bin) or {}
+	}
+	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
+		panic('connect_stdio: ${err.msg()}')
+	}
+	defer {
+		client.close()
+	}
+	client.initialize()!
+
+	// a two-test fixture: one passes, one fails
+	dir := os.join_path(os.temp_dir(), 'v_test_stats_${os.getpid()}')
+	os.rmdir_all(dir) or {}
+	os.mkdir(dir)!
+	os.write_file(os.join_path(dir, 'probe_test.v'), 'fn test_alpha_ok() {\n\tassert 1 + 1 == 2\n}\n\nfn test_beta_fail() {\n\tassert 1 + 1 == 3\n}\n')!
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	res := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_test'
+			arguments: {
+				'path':  json2.Any(dir)
+				'stats': json2.Any(true)
+			}
+		}) or { panic('tools/call v_test: ${err.msg()}') }
+	assert !res.is_error, res.content
+	assert res.content.contains('tests: 1/2 passed'), res.content
+	assert res.content.contains('test_alpha_ok'), res.content
+	assert res.content.contains('test_beta_fail'), res.content
+	assert res.content.contains('failure detail:'), res.content
+
+	// stats + only: the glob narrows the suite to one function
+	res2 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_test'
+			arguments: {
+				'path':  json2.Any(dir)
+				'only':  json2.Any('*alpha*')
+				'stats': json2.Any(true)
+			}
+		}) or { panic('tools/call v_test only: ${err.msg()}') }
+	assert !res2.is_error, res2.content
+	assert res2.content.contains('tests: 1/1 passed'), res2.content
+	assert res2.content.contains('test_alpha_ok'), res2.content
+	assert !res2.content.contains('test_beta_fail'), res2.content
+}
+
+fn test_build_cache_key_determinism_and_scope() {
+	dir := os.join_path(os.temp_dir(), 'cachekey_${os.getpid()}')
+	os.rmdir_all(dir) or {}
+	os.mkdir_all(dir)!
+	os.write_file(os.join_path(dir, 'main.v'), 'fn main() {\n\tprintln(1)\n}\n')!
+	os.write_file(os.join_path(dir, 'v.mod'), "Module {\n\tname: 'cacheprobe'\n}\n")!
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	key1 := build_cache_key(dir, [])
+	key2 := build_cache_key(dir, [])
+	assert key1 == key2, 'same tree, same key'
+	assert key1.len == 64, 'sha256 hex'
+	// vflags are part of the identity
+	assert build_cache_key(dir, ['-prod']) != key1
+	// a source rewrite changes the key
+	os.write_file(os.join_path(dir, 'main.v'), 'fn main() {\n\tprintln(2)\n}\n')!
+	assert build_cache_key(dir, []) != key1
+	// a single .v file hashes only itself — directory/rewrites beside it don't
+	file := os.join_path(os.temp_dir(), 'cachekey_probe_${os.getpid()}.v')
+	os.write_file(file, 'fn main() {\n\tprintln(3)\n}\n')!
+	defer {
+		os.rm(file) or {}
+	}
+	fkey1 := build_cache_key(file, [])
+	assert fkey1.len == 64
+	assert fkey1 != key1
+	os.write_file(os.join_path(dir, 'main.v'), 'fn main() {\n\tprintln(4)\n}\n')!
+	assert build_cache_key(file, []) == fkey1, 'file key ignores sibling content'
+}
+
+fn test_cache_save_and_load_round_trip() {
+	key := '0'.repeat(64)
+	rec := CachedBuild{
+		ok:      true
+		text:    'cached text'
+		summary: ''
+	}
+	cache_save(key, rec, '')
+	loaded := cache_load(key) or {
+		assert false, 'cache_load returned none for a saved record'
+		rec
+	}
+	assert loaded.ok
+	assert loaded.text == 'cached text'
+	// a record that never existed loads as none
+	if miss := cache_load('f'.repeat(64)) {
+		_ = miss
+		assert false, 'absent key must load as none'
+	}
+}
+
+fn test_v_run_warm_cache_round_trip() {
+	bin := compile_server()
+	defer {
+		os.rm(bin) or {}
+	}
+	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
+		panic('connect_stdio: ${err.msg()}')
+	}
+	defer {
+		client.close()
+	}
+	client.initialize()!
+
+	prog := os.join_path(os.temp_dir(), 'cache_probe_${os.getpid()}.v')
+	os.write_file(prog, 'fn main() {\n\tprintln("gamma-7")\n}\n')!
+	defer {
+		os.rm(prog) or {}
+	}
+	res1 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_run'
+			arguments: {
+				'path': json2.Any(prog)
+			}
+		}) or { panic('tools/call v_run 1: ${err.msg()}') }
+	assert !res1.is_error, res1.content
+	assert res1.content.contains('gamma-7'), res1.content
+	// the compile is stored: record and binary exist under the key
+	key := build_cache_key(prog, [])
+	assert key.len == 64
+	stored := cache_load(key) or {
+		assert false, 'cache miss after first v_run call'
+		CachedBuild{}
+	}
+	assert stored.ok, 'a successful v_run build is cached'
+	assert os.is_file(os.join_path(cache_dir(), key, 'bin')), 'the binary is cached'
+	// second call replays the stored binary — byte-identical result, no v run
+	res2 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_run'
+			arguments: {
+				'path': json2.Any(prog)
+			}
+		}) or { panic('tools/call v_run 2: ${err.msg()}') }
+	assert !res2.is_error, res2.content
+	assert res2.content == res1.content, 'hit replays the same result'
+	// rewriting the source busts the key: a fresh compile runs
+	os.write_file(prog, 'fn main() {\n\tprintln("gamma-8")\n}\n')!
+	res3 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_run'
+			arguments: {
+				'path': json2.Any(prog)
+			}
+		}) or { panic('tools/call v_run 3: ${err.msg()}') }
+	assert !res3.is_error, res3.content
+	assert res3.content.contains('gamma-8'), 'key change forces recompile'
+	assert res3.content != res1.content, res3.content
 }
