@@ -41,8 +41,8 @@ jobs:
       - name: v version (sanity)
         run: v version
 
-      - name: Install the vrepo dependency
-        run: v install gil-silva.vrepo
+      - name: Install the vrepo and vaffected dependencies
+        run: v install gil-silva.vrepo gil-silva.vaffected
 
       - name: Build
         run: v -no-parallel -o bin/v-mcp-server .
@@ -70,8 +70,8 @@ jobs:
       - name: v version (sanity)
         run: v version
 
-      - name: Install the vrepo dependency
-        run: v install gil-silva.vrepo
+      - name: Install the vrepo and vaffected dependencies
+        run: v install gil-silva.vrepo gil-silva.vaffected
 
       - name: v fmt -c (strict)
         run: v fmt -c .
