@@ -955,12 +955,33 @@ fn test_parse_test_rows() {
 	assert rows[0].name == 'main.test_add_ok', rows[0].name
 	assert rows[0].ok
 	assert rows[0].file == '/tmp/probe/main_test.v', rows[0].file
+	assert rows[0].at == '', rows[0].at
+	assert rows[0].detail == '', rows[0].detail
 	assert rows[1].name == 'main.test_add_fail', rows[1].name
 	assert !rows[1].ok
 	assert rows[1].ms > 0.01, '${rows[1].ms} ms'
+	assert rows[1].at == '', rows[1].at
 	// all-passing report: rows only, no detail section
 	assert !test_report([rows[0]], 'raw').contains('failure detail')
 	assert test_report([rows[1]], 'boom detail').contains('failure detail:\nboom detail')
+
+	// a real `-stats` failure block: the header line and the failing
+	// statement with its captured values land on the row as at/detail
+	failing := 'running tests in: /tmp/probe/sum_test.v\n' +
+		'/tmp/probe/sum_test.v:12: fn test_sum\n' +
+		'   > assert x == y\n' +
+		'     Left value (len: 1): `3`\n' +
+		'    Right value (len: 1): `5`\n' +
+		'\n' +
+		'     FAIL  [1/1]     0.010 ms     1 assert | main.test_sum()\n'
+	failed := parse_test_rows(failing)
+	assert failed.len == 1, '${failed.len} rows'
+	assert failed[0].at == '/tmp/probe/sum_test.v:12: fn test_sum', failed[0].at
+	assert failed[0].detail.contains('assert x == y'), failed[0].detail
+	assert failed[0].detail.contains('Left value'), failed[0].detail
+	assert failed[0].detail.contains('Right value (len: 1): `5`'), failed[0].detail
+	// the header line itself moves into `at`, not the detail
+	assert !failed[0].detail.contains('fn test_sum'), failed[0].detail
 }
 
 fn test_v_test_stats_round_trip() {

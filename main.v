@@ -955,7 +955,9 @@ fn diagnostic_kind(word string) string {
 }
 
 // TestRow is one parsed `v -stats test` result line, attributed to the file
-// the row's `running tests in:` cue set.
+// the row's `running tests in:` cue set. Failing rows carry the failure
+// context `v` prints above them: `at` names the header line (file:line + fn)
+// and `detail` holds the failing statement plus any captured values.
 struct TestRow {
 pub:
 	file    string
@@ -963,6 +965,8 @@ pub:
 	ok      bool
 	ms      f64
 	asserts int
+	at      string
+	detail  string
 }
 
 // GateSection is one v_gate check verdict: the ok flag plus the detail text
@@ -989,19 +993,28 @@ pub:
 	ok        bool
 }
 
+// test_context_lines bounds how many failure-context lines one FAIL row
+// carries: `v -stats` prints the header + failing statement + captured
+// values above each FAIL result line (panic-style traces can be longer, but
+// they kill the runner before a FAIL row even lands).
+const test_context_lines = 8
+
 // parse_test_rows extracts one row per test result from `v -stats test`
 // output. File attribution comes from the `running tests in:` cues; result
 // lines are shaped `     OK    [1/2]     0.000 ms     1 assert | mod.fn()`
-// (FAIL counts the same). Unrelated lines pass by; a result line whose shape
-// does not fit yields no row, and no rows at all means the caller falls back
-// to the raw output.
+// (FAIL counts the same). FAIL rows carry `at` and `detail`: the header line
+// (`file:LINE: fn name`) and the source context above the row. Unrelated
+// lines pass by; a result line whose shape does not fit yields no row, and
+// no rows at all means the caller falls back to the raw output.
 fn parse_test_rows(text string) []TestRow {
 	mut rows := []TestRow{}
 	mut file := ''
+	mut context := []string{}
 	for raw_line in text.split_into_lines() {
 		line := raw_line.trim_space()
 		if line.starts_with('running tests in: ') {
 			file = line.after('running tests in: ').trim_space()
+			context.clear()
 			continue
 		}
 		mut kind := ''
@@ -1010,26 +1023,54 @@ fn parse_test_rows(text string) []TestRow {
 		} else if line.starts_with('FAIL ') {
 			kind = 'FAIL'
 		}
-		if kind == '' {
+		// unparsable lines between results are the failure context; a
+		// looking result line whose shape does not fit is junk, not
+		// context, and passes by without buffering
+		if kind != '' {
+			sep := line.index(' | ') or { continue }
+			fields := line[..sep].trim_space().fields()
+			tail := line[sep + 3..].trim_space()
+			if fields.len < 6 || !fields[1].starts_with('[') || fields[3] != 'ms' {
+				continue
+			}
+			if !tail.ends_with('()') || !tail.contains('.') {
+				continue
+			}
+			// the failure context `v` prints above a FAIL row: its header
+			// line (`file:LINE: fn name`) becomes at, the rest becomes
+			// detail (the failing statement plus captured values)
+			mut fail_at := ''
+			mut fail_detail := ''
+			if kind == 'FAIL' && context.len > 0 {
+				mut head := -1
+				for idx, cline in context {
+					if cline.contains(': fn ') {
+						head = idx
+						break
+					}
+				}
+				if head >= 0 {
+					fail_at = context[head]
+					fail_detail = context[head + 1..].join('\n').trim_space()
+				} else {
+					fail_detail = context.join('\n').trim_space()
+				}
+			}
+			rows << TestRow{
+				file:    file
+				name:    tail[..tail.len - 2]
+				ok:      kind == 'OK'
+				ms:      fields[2].f64()
+				asserts: fields[4].int()
+				at:      fail_at
+				detail:  fail_detail
+			}
+			context.clear()
 			continue
 		}
-		// `fields | mod.fn_name()` — the left side is `[N/M] <ms> ms <n> assert`
-		// (fields named exactly that), the right side names the test
-		sep := line.index(' | ') or { continue }
-		fields := line[..sep].trim_space().fields()
-		tail := line[sep + 3..].trim_space()
-		if fields.len < 6 || !fields[1].starts_with('[') || fields[3] != 'ms' {
-			continue
-		}
-		if !tail.ends_with('()') || !tail.contains('.') {
-			continue
-		}
-		rows << TestRow{
-			file:    file
-			name:    tail[..tail.len - 2]
-			ok:      kind == 'OK'
-			ms:      fields[2].f64()
-			asserts: fields[4].int()
+		context << line
+		if context.len > test_context_lines {
+			context.delete(0)
 		}
 	}
 	return rows
@@ -1644,7 +1685,7 @@ fn v_repo_brief_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 // library walks the static import graph from there. Shared by the v_affected
 // tool and the v_gate commit-gate report.
 fn affected_test_files(path string, base string) ![]string {
-	b := if base.len > 0 { base } else { 'HEAD' }
+	b := if base != '' { base } else { 'HEAD' }
 	// Changed paths come from git, relative to a.path; the library receives
 	// them as plain data (same contract its CLI uses). Spawned like every
 	// other child (run_capture): streams split, timeout cap applied.
