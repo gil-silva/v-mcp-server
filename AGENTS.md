@@ -63,3 +63,62 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+## 5. V Rules
+
+V-specific rules. Full reference: `../v-release-052/v/AGENTS.md`.
+
+### Style and structure
+- Doc comments use `//` (never `///` or `/**`), placed above public fns and starting with the fn
+  name: `// parse does ...`.
+- Generics use `[T]`, never `<T>`.
+- `unsafe{}` only where required (C interop, manual memory management): smallest possible scope,
+  with a comment explaining why it is needed.
+- Module names must match their directory; imports follow the folder hierarchy
+  (`import abc.def`). Mismatches cause silent import failures.
+- No hidden or bidirectional Unicode characters in source files.
+- Tools: `v fmt -w file.v` (format touched files), `v vet dir/` (style checker),
+  `v doc modulename` (module docs).
+
+### Comptime vs runtime (most common agent mistakes)
+- `$if` is compile-time, not runtime: `$if windows`, `$if debug`, `$if prod`,
+  `$if custom_flag ?`. Custom flags need the `?` suffix; without it the compiler silently
+  ignores the condition.
+- For whole-file platform code use file suffixes: `*_windows.c.v`, `*_linux.c.v`,
+  `*_nix.c.v`, with `*_default.c.v` as fallback; `*_d_flag.v` is included only with
+  `-d flag`. Never combine OS and flag in one suffix; use `_d_flag.v` plus `$if linux`
+  inside the file.
+- `$for` iterates type metadata at compile time: `StructType.fields`, `StructType.methods`,
+  `EnumType.values`, `SumType.variants`; in generics use `T.fields`. V has no runtime
+  reflection - a runtime `for` over struct fields does not work.
+- `obj.$method()` calls are valid only inside a `$for m in Type.methods` block.
+- `$`-functions: `$embed_file` (returns `EmbedFileData`; use `.to_string()`), `$tmpl`,
+  `$env` (baked at compile time; use `os.getenv` for runtime values), `$d('ident', default)`,
+  `$pkgconfig`, `$compile_error`, `$compile_warn`. There are no `$typeof`/`$sizeof` comptime
+  calls - use `typeof(expr).name` and `sizeof(Type)`.
+- Comptime type groups, usable as `$if field.typ is $int { ... }`: `$int`, `$float`,
+  `$array`, `$map`, `$struct`, `$enum`, `$alias`, `$sumtype`, `$function`, `$interface`,
+  `$option`.
+- Compile-time pseudo variables: `@FN`, `@METHOD`, `@MOD`, `@STRUCT`, `@FILE`, `@DIR`,
+  `@LINE`, `@COLUMN`, `@FILE_LINE`, `@LOCATION` (good for logging), `@VEXE`, `@VMODROOT`,
+  `@BUILD_DATE`, `@BUILD_TIME`, `@BUILD_TIMESTAMP`, `@OS`, `@BACKEND`.
+
+### Interop and Option/Result
+- `C.` and `JS.` symbols belong in `.c.v` / `.js.v` files, not plain `.v` files;
+  `-Wimpure-v` catches violations. Do not refactor existing interop code unless required.
+- `?Type` is option (may be none), `!Type` is result (may error). Known pitfalls: unwrapping
+  options in `if` guards, struct literals with option fields, option values in ternaries.
+
+### Build, run, debug, test
+- Build multi-file projects from the repo root with `v .`; never `v single_file.v` there.
+- Run: `v run file.v`. Debug: `v -g run file.v` (V line numbers); C-level crashes:
+  `v -keepc -cg -cc clang run file.v`.
+- Generated code inspection: `-keepc` keeps the generated C, `-showcc` prints the C compile
+  command, `-show-c-output` prints C compiler output, `-printfn main__main` prints only that
+  generated C function (repeatable; C names look like `module__fnname`).
+- Tests: `v file_test.v` (run one test file, shows output), `v -silent test dir/` (dir
+  report), `v -stats test dir/` (with metrics). Filter with `VTEST_ONLY=glob`
+  and `VTEST_HIDE_OK=1`.
+- `VFLAGS='...'` passes flags to every V invocation.
+- Output tests need exact matches (whitespace included); update expectations only when a
+  behavior change was intended, else treat mismatches as regressions.
