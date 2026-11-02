@@ -555,6 +555,42 @@ fn test_v_gate_affected_requires_git() {
 	assert res.content.contains('v_gate: affected set:'), res.content
 }
 
+fn test_v_gate_panic_round_trip() {
+	bin := compile_server()
+	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
+		panic('connect_stdio: ${err.msg()}')
+	}
+	defer {
+		client.close()
+	}
+	client.initialize()!
+	dir := gate_fixture_repo()!
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	// the working file becomes clean-formatted with a panicking second test
+	// (still uncommitted vs HEAD): fmt and vet pass, the affected set is the
+	// one file, and its narrowed run dies mid-suite with no FAIL row — the
+	// tests section must fail the gate AND carry the raw panic text
+	os.write_file(os.join_path(dir, 'partzok_test.v'),
+		"module main\n\nfn test_fore() {\n\tassert true\n}\n\nfn test_boom() {\n\tpanic('kaboom')\n}\n")!
+	res := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_gate'
+			arguments: {
+				'path':      json2.Any(dir)
+				'run_tests': json2.Any(true)
+			}
+		}) or { panic('tools/call v_gate panic: ${err.msg()}') }
+	assert res.is_error, res.content
+	assert res.content.contains('\\"fmt_check\\":{\\"ok\\":true'), res.content
+	assert res.content.contains('\\"affected\\":[\\"partzok_test.v\\"'), res.content
+	assert res.content.contains('\\"tests_run\\":true'), res.content
+	assert res.content.contains('\\"tests\\":{\\"ok\\":false'), res.content
+	assert res.content.contains('test_fore'), res.content
+	assert res.content.contains('kaboom'), res.content
+}
+
 fn test_v_scratch_and_timeout_round_trips() {
 	bin := compile_server()
 	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
@@ -1010,7 +1046,8 @@ fn test_v_test_stats_round_trip() {
 	defer {
 		os.rmdir_all(dir) or {}
 	}
-	// both files are on: alpha+gamma pass, beta fails
+	// both files are on: alpha+gamma pass, beta fails — a failing run is
+	// an error result, the same contract as the plain branch and v_gate
 	res := client.request[CallToolParams, CallToolResult]('tools/call',
 		CallToolParams{
 			name:      'v_test'
@@ -1019,7 +1056,7 @@ fn test_v_test_stats_round_trip() {
 				'stats': json2.Any(true)
 			}
 		}) or { panic('tools/call v_test: ${err.msg()}') }
-	assert !res.is_error, res.content
+	assert res.is_error, res.content
 	assert res.content.contains('tests: 2/3 passed'), res.content
 	assert res.content.contains('test_alpha_ok'), res.content
 	assert res.content.contains('test_beta_fail'), res.content
@@ -1057,6 +1094,30 @@ fn test_v_test_stats_round_trip() {
 	assert res3.content.contains('test_gamma_ok'), res3.content
 	assert !res3.content.contains('test_beta_fail'), 'filtered file excluded: ${res3.content}'
 	assert !res3.content.contains('test_alpha_ok'), res3.content
+
+	// a panic kills the runner with no FAIL row: the earlier OK row still
+	// parses, and the run-level failure must surface — an error result
+	// carrying the rows plus the raw panic text as the raw view
+	dir2 := os.join_path(os.temp_dir(), 'v_test_panic_${os.getpid()}')
+	os.rmdir_all(dir2) or {}
+	os.mkdir(dir2)!
+	os.write_file(os.join_path(dir2, 'boom_test.v'),
+		"fn test_fore() {\n\tassert true\n}\n\nfn test_boom() {\n\tpanic('kaboom')\n}\n")!
+	defer {
+		os.rmdir_all(dir2) or {}
+	}
+	res4 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_test'
+			arguments: {
+				'path':  json2.Any(dir2)
+				'stats': json2.Any(true)
+			}
+		}) or { panic('tools/call v_test panic: ${err.msg()}') }
+	assert res4.is_error, res4.content
+	assert res4.content.contains('tests: 1/1 passed'), res4.content
+	assert res4.content.contains('raw view (the run did not finish cleanly)'), res4.content
+	assert res4.content.contains('kaboom'), res4.content
 }
 
 fn test_build_cache_key_determinism_and_scope() {

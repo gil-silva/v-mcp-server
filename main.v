@@ -76,11 +76,12 @@ const server_info_schema = '{"type":"object","properties":{},"additionalProperti
 // v_test_schema declares path as required, only as an optional glob that
 // selects test functions, files as an optional VTEST_ONLY filter that
 // selects test files (both forwarded through env(1)), stats as an
-// optional boolean switching to structured per-test rows, and timeout as
-// the optional per-call cap for the whole test run; `path` must stay
+// optional boolean switching to structured per-test rows (failing rows
+// additionally carry at/detail), and timeout as the optional per-call cap
+// for the whole test run; `path` must stay
 // the first property — smoke.vsh counts `"properties":{"path":{`
 // occurrences server-wide.
-const v_test_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V test file or project directory","type":"string"},"only":{"description":"VTEST_ONLY_FN glob: run only test functions whose name matches (optional string, e.g. \\"*handshake*\\")","type":"string"},"files":{"description":"VTEST_ONLY filter: run only the test files whose path (relative to path) contains one of the comma-separated patterns (optional string, e.g. \\"parse_test.v\\"); pairs with the v_affected output","type":"string"},"stats":{"description":"Return structured per-test rows [{file,name,ok,ms,asserts}] instead of raw output (optional boolean); the raw output trails the rows as failure detail when tests fail","type":"boolean"},"timeout":{"description":"Per-call timeout cap in seconds, 1..1800 (optional integer, default 600): the whole test run is killed when it exceeds it","type":"integer"}},"required":["path"],"additionalProperties":false}'
+const v_test_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V test file or project directory","type":"string"},"only":{"description":"VTEST_ONLY_FN glob: run only test functions whose name matches (optional string, e.g. \\"*handshake*\\")","type":"string"},"files":{"description":"VTEST_ONLY filter: run only the test files whose path (relative to path) contains one of the comma-separated patterns (optional string, e.g. \\"parse_test.v\\"); pairs with the v_affected output","type":"string"},"stats":{"description":"Return structured per-test rows [{file,name,ok,ms,asserts}] instead of raw output (optional boolean); failing rows also carry at (the file:LINE: fn name header v prints above the row) and detail (the failing statement plus its captured values); the raw output trails the rows as failure detail when tests fail; a failed run (failing tests, timeout, or a mid-run death) is an error result","type":"boolean"},"timeout":{"description":"Per-call timeout cap in seconds, 1..1800 (optional integer, default 600): the whole test run is killed when it exceeds it","type":"integer"}},"required":["path"],"additionalProperties":false}'
 
 // v_uses_schema declares path as required and symbol as an optional string
 // the tool itself validates; same `path`-first rule as every other schema.
@@ -1180,7 +1181,18 @@ fn v_test_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 		}
 		return mcp.tool_text_result(truncate(text))
 	}
-	return mcp.tool_text_result(truncate(test_report(rows, text)))
+	// the run itself failed — a partial suite (rows parsed for the files
+	// that ran before a panic or a later compile failure) still shows as
+	// rows: the verdict is an error either way, and the raw view follows
+	// when the rows carry no failure detail of their own
+	mut report := test_report(rows, text)
+	if c.exit_code != 0 || c.timed_out {
+		if !report.contains('failure detail:') {
+			report += '\n\nraw view (the run did not finish cleanly):\n' + text.trim_space()
+		}
+		return to_error_result(truncate(report))
+	}
+	return mcp.tool_text_result(truncate(report))
 }
 
 // ---- v_gate: the one-call commit gate ---------------------------------------
@@ -1256,10 +1268,11 @@ fn v_gate_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 					}
 				}
 			} else {
-				tests_section = GateSection{
-					ok:   tc.exit_code == 0 && !tc.timed_out && rows.all(it.ok)
-					rows: rows
-				}
+				run_ok := tc.exit_code == 0 && !tc.timed_out && rows.all(it.ok)
+				// rows explain a row-level failure; a run that died without
+				// any FAIL row (a panic) gets the raw text as its detail
+				detail := if !run_ok && rows.all(it.ok) { text.trim_space() } else { '' }
+				tests_section = GateSection{ ok: run_ok, rows: rows, detail: detail }
 			}
 		}
 	}
@@ -1306,11 +1319,25 @@ fn v_fmt_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	}
 	d := run_capture(['v', 'fmt', '-diff', a.path], tool_timeout_seconds)
 	diff_text := strip_ansi(merge_streams(d.stdout, d.stderr).trim_space())
-	out := if diff_text == '' { files_list } else { files_list + '\n\ndiff:\n' + diff_text }
+	// a killed or quietly-failing diff spawn gets a labeled tail, so the
+	// reply explains its own shape (the drift list still stands); the tail
+	// is empty in the normal case
+	tail := if d.timed_out {
+		'\n\nv fmt -diff timed out after ${tool_timeout_seconds} s'
+	} else if diff_text == '' && d.exit_code != 0 {
+		'\n\nv fmt -diff exited with code ${d.exit_code} (no output)'
+	} else {
+		''
+	}
+	out := if diff_text == '' {
+		files_list + tail
+	} else {
+		files_list + '\n\ndiff:\n' + diff_text + tail
+	}
 	return if c.exit_code != 0 || d.exit_code != 0 || d.timed_out {
 		to_error_result(out)
 	} else {
-		mcp.tool_text_result(out)
+		mcp.tool_text_result(truncate(out))
 	}
 }
 
@@ -1468,7 +1495,7 @@ fn v_symbols_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	for s in syms {
 		b << '${s.line}\t${s.kind}\t${s.name}'
 	}
-	return mcp.tool_text_result('line\tkind\tname\n' + b.join('\n'))
+	return mcp.tool_text_result(truncate('line\tkind\tname\n' + b.join('\n')))
 }
 
 // SymbolSource is a v_read slice: the verbatim text and its 1-based line
@@ -1809,7 +1836,7 @@ fn new_vlang_server() !mcp.Server {
 	}, v_errors_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_test'
-		description:  'Run `v test` on a file or project (path). Optional only (string) is a VTEST_ONLY_FN glob forwarded via env(1) — run only test functions whose name matches, e.g. "*handshake*". Optional files (string) is a VTEST_ONLY file filter forwarded via env(1) — run only test files whose relative path contains one of the comma-separated patterns, e.g. "parse_test.v"; pairs with the v_affected output. Optional stats (boolean) returns structured rows [{file,name,ok,ms,asserts}] with the raw output as failure detail; unparsable runs fall back to the raw view. Optional timeout (integer seconds, 1..1800, default 600) raises the whole-run cap.'
+		description:  'Run `v test` on a file or project (path). Optional only (string) is a VTEST_ONLY_FN glob forwarded via env(1) — run only test functions whose name matches, e.g. "*handshake*". Optional files (string) is a VTEST_ONLY file filter forwarded via env(1) — run only test files whose relative path contains one of the comma-separated patterns, e.g. "parse_test.v"; pairs with the v_affected output. Optional stats (boolean) returns structured rows [{file,name,ok,ms,asserts}] — failing rows also carry at (the file:LINE: fn name header v prints above the row) and detail (the failing statement plus its captured values); the raw output trails as failure detail; unparsable runs fall back to the raw view; a failed run (failing tests, timeout, or a mid-run death) is an error result carrying the rows. Optional timeout (integer seconds, 1..1800, default 600) raises the whole-run cap.'
 		input_schema: v_test_schema
 	}, v_test_tool)!
 	server.add_tool(mcp.Tool{
