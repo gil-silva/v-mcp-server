@@ -1,17 +1,48 @@
 // Integration + unit tests for v-mcp-server.
 //
-// The end-to-end test compiles this repository, then drives the compiled
+// The end-to-end tests compile this repository, then drive the compiled
 // stdio server with the official vlib/mcp *client* (connect_stdio →
 // initialize → tools/list → tools/call). It is the same contract an agent
 // session exercises, without any agent in the loop.
 module main
 
+import crypto.sha256
 import mcp
 import json2
 import os
 
+// server_src_key hashes what the server binary compile actually consumes —
+// every non-test .v file under @VMODROOT plus the toolchain version — into
+// the binary's file name. Test edits recompile nothing (a _test.v is not
+// part of the server build); a main.v edit rebuilds once.
+fn server_src_key() string {
+	mut rows := []string{}
+	mut files := os.ls(@VMODROOT) or { [] }
+	files.sort()
+	for f in files {
+		if !f.ends_with('.v') || f.ends_with('_test.v') {
+			continue
+		}
+		src := os.read_file(os.join_path(@VMODROOT, f)) or { continue }
+		rows << '${f}\x1f${sha256.sum(src.bytes()).hex()[..16]}'
+	}
+	rows << 'toolchain\x1f${toolchain_stamp()}'
+	return sha256.sum(rows.join('\n').bytes()).hex()[..12]
+}
+
+// compile_server compiles this repository's server binary and returns its
+// absolute path. The name is content-keyed (server_src_key), so every E2E
+// fn of one run — all of it executing in a single test process — and every
+// rerun on unchanged sources reuses one binary: the compile happens once
+// per source state instead of once per fn, which is what keeps the suite
+// from paying ten times the same ~10 s of checker work. The artifact stays
+// in the temp dir on purpose (a shared bin deleted after one fn would
+// vanish underneath the rest of the run).
 fn compile_server() string {
-	bin := os.join_path(os.temp_dir(), 'v-mcp-server-test-${os.getpid()}')
+	bin := os.join_path(os.temp_dir(), 'v-mcp-server-test-${server_src_key()}')
+	if os.is_file(bin) {
+		return bin
+	}
 	res := os.exec([@VEXE, '-o', bin, '-no-parallel', @VMODROOT])
 	if res.exit_code != 0 {
 		panic('server failed to compile:\n${res.output}')
@@ -40,9 +71,6 @@ pub:
 
 fn test_compile_and_handshake() {
 	bin := compile_server()
-	defer {
-		os.rm(bin) or {}
-	}
 
 	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
 		panic('connect_stdio: ${err.msg()}')
@@ -74,11 +102,17 @@ fn test_compile_and_handshake() {
 	assert names.contains('v_scratch'), names.str()
 }
 
+fn test_compile_server_reuses_bin() {
+	// same source state → one binary for the whole run: this is what keeps
+	// the suite from compiling the server once per E2E fn
+	a := compile_server()
+	b := compile_server()
+	assert a == b, '${a} vs ${b}'
+	assert os.is_file(a), a
+}
+
 fn test_v_repo_brief_call_round_trip() {
 	bin := compile_server()
-	defer {
-		os.rm(bin) or {}
-	}
 	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
 		panic('connect_stdio: ${err.msg()}')
 	}
@@ -105,9 +139,6 @@ struct Empty_tool_params {}
 
 fn test_v_symbols_call_round_trip() {
 	bin := compile_server()
-	defer {
-		os.rm(bin) or {}
-	}
 
 	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
 		panic('connect_stdio: ${err.msg()}')
@@ -180,9 +211,6 @@ fn test_parse_diagnostics_skips_noise_and_dedupes() {
 
 fn test_v_run_and_v_errors_round_trips() {
 	bin := compile_server()
-	defer {
-		os.rm(bin) or {}
-	}
 	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
 		panic('connect_stdio: ${err.msg()}')
 	}
@@ -283,9 +311,6 @@ fn test_v_run_and_v_errors_round_trips() {
 
 fn test_v_scratch_and_timeout_round_trips() {
 	bin := compile_server()
-	defer {
-		os.rm(bin) or {}
-	}
 	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
 		panic('connect_stdio: ${err.msg()}')
 	}
@@ -389,9 +414,6 @@ fn test_v_scratch_and_timeout_round_trips() {
 
 fn test_v_uses_call_round_trip() {
 	bin := compile_server()
-	defer {
-		os.rm(bin) or {}
-	}
 	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
 		panic('connect_stdio: ${err.msg()}')
 	}
@@ -428,9 +450,6 @@ fn test_v_uses_call_round_trip() {
 
 fn test_v_deps_multiline_round_trip() {
 	bin := compile_server()
-	defer {
-		os.rm(bin) or {}
-	}
 	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
 		panic('connect_stdio: ${err.msg()}')
 	}
@@ -556,9 +575,6 @@ fn test_symbol_source_slices_and_misses() {
 
 fn test_v_where_v_read_and_argument_validation() {
 	bin := compile_server()
-	defer {
-		os.rm(bin) or {}
-	}
 	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
 		panic('connect_stdio: ${err.msg()}')
 	}
@@ -709,9 +725,6 @@ fn test_parse_test_rows() {
 
 fn test_v_test_stats_round_trip() {
 	bin := compile_server()
-	defer {
-		os.rm(bin) or {}
-	}
 	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
 		panic('connect_stdio: ${err.msg()}')
 	}
@@ -843,9 +856,6 @@ fn test_cache_save_and_load_round_trip() {
 
 fn test_v_run_warm_cache_round_trip() {
 	bin := compile_server()
-	defer {
-		os.rm(bin) or {}
-	}
 	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
 		panic('connect_stdio: ${err.msg()}')
 	}
