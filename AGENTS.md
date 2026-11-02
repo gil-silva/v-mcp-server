@@ -122,3 +122,28 @@ V-specific rules. Full reference: `../v-release-052/v/AGENTS.md`.
 - `VFLAGS='...'` passes flags to every V invocation.
 - Output tests need exact matches (whitespace included); update expectations only when a
   behavior change was intended, else treat mismatches as regressions.
+
+## 6. The vlang MCP server (this repo)
+
+`bin/v-mcp-server` is the stdio MCP server this repo builds, and coding agents
+running in this workspace are expected to use it instead of spawning `v`
+directly. It exposes eight tools, each taking one absolute `path`:
+`v_build`, `v_test`, `v_fmt_check`, `v_vet`, `v_ast`, `v_symbols`, `v_deps`,
+`v_repo_brief` (the last one maps V repos via the `vrepo` library).
+
+- OpenCode registers it globally as `vlang` in `~/.config/opencode/opencode.json`.
+  Under Code Mode, call its tools from `execute`:
+  `tools.vlang.v_test({ path: '/abs/path' })` — normalized tool names are
+  `<server>_<tool>`.
+- Always pass absolute paths; the server does no path fixing.
+- Check connection state with `opencode mcp list`; reconnect with `/mcps`.
+- After changing server code: rebuild with `v -o bin/v-mcp-server -no-parallel .`,
+  then force clients to re-spawn the binary — in OpenCode, touch the config file
+  or run `/mcps`. Connection state is long-lived: a failed spawn (e.g. racing a
+  rebuild) keeps the server marked failed and its schemas cached until a
+  fresh connect.
+- Keep `properties.path` and `required: ["path"]` in every tool's
+  `inputSchema`. Schema-validating clients silently drop arguments when a
+  schema declares no properties; `v run smoke.vsh` fails if that invariant
+  breaks (it counts path properties per tool and asserts the call result
+  carries real data).
