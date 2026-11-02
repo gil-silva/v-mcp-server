@@ -11,7 +11,7 @@ structured diagnostics, smart test selection, repo maps — over the
 ![vpm](https://img.shields.io/badge/vpm-gil--silva.vmcpserver-8a5f4a)
 ![license](https://img.shields.io/badge/license-MIT-3a8a5f)
 
-*Vibes-driven coding is optional. Compiler-driven comes free.*
+*Stop guessing. Compile-verify every change.*
 
 </div>
 
@@ -30,7 +30,8 @@ V toolchain instead of a mouse.
 ## The loop it turns on
 
 Before: an agent in your repo has to guess what "wrong" looks like in V —
-*vibes-driven* editing. After: every change closes a compiler-verified loop.
+*guess-and-pray* editing. After: every change closes a compiler-verified
+loop.
 
 ```mermaid
 sequenceDiagram
