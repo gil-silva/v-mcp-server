@@ -7,7 +7,7 @@ structured diagnostics, smart test selection, repo maps — over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
 [![CI](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-0.4.0-4a6b9e)
+![version](https://img.shields.io/badge/version-0.5.0-4a6b9e)
 ![vpm](https://img.shields.io/badge/vpm-gil--silva.vmcpserver-8a5f4a)
 ![license](https://img.shields.io/badge/license-MIT-3a8a5f)
 
@@ -176,11 +176,12 @@ one-call patterns), so the savings show up in your context every session.
 
 | Tool          | Arguments | What it does |
 |---------------|-----------|--------------|
-| `v_build`     | `{path}`  | compiles and returns compiler diagnostics |
-| `v_run`       | `{path, args?}` | compiles `path`, executes the binary; optional `args` (JSON array of strings) become the program's argv, output returned |
+| `v_build`     | `{path, vflags?}` | compiles and returns compiler diagnostics; optional `vflags` (JSON array of strings) is forwarded verbatim to the V CLI (e.g. `-g`, `-prod`, `-cc clang`, `-d flag`) |
+| `v_run`       | `{path, args?, vflags?}` | compiles `path`, executes the binary; optional `args` (JSON array of strings) become the program's argv, optional `vflags` are forwarded to the compiler, output returned |
 | `v_errors`    | `{path}`  | compile-only; diagnostics as JSON `[{file,line,col,kind,message}]` — `[]` means clean |
 | `v_test`      | `{path}`  | runs `v test` |
 | `v_fmt_check` | `{path}`  | `v fmt -c` — check only, never touches files |
+| `v_fmt`       | `{path}`  | `v fmt -w` — format in place (mutates files) |
 | `v_vet`       | `{path}`  | `v vet` warnings |
 | `v_ast`       | `{path}`  | `v ast -p` AST JSON (output capped at 100 kB) |
 | `v_symbols`   | `{path}`  | outline of fns/structs/interfaces/enums/consts/types + line numbers |
@@ -188,6 +189,7 @@ one-call patterns), so the savings show up in your context every session.
 | `v_repo_brief`| `{path}`  | compact repo map: module identity, entry points, tree with LOC, per-file symbol outlines (~40k char cap) |
 | `v_affected`  | `{path, base?}` | `*_test.v` files a change can affect: git diff vs `base` (default `HEAD`), propagated through the static import graph |
 | `v_uses`      | `{path, symbol}` | who-uses-what for a declared symbol: definitions (`file:line` per kind), call/constructor sites with the enclosing fn/method, and — when the symbol names an interface — approximated implementing types; comments/strings scrubbed |
+| `v_server_info` | — | the running build: name, version, compile-time build timestamp, and the underlying `v -version` — one call to spot a stale binary |
 
 All tools expect **absolute** paths (e.g. `/home/you/vlang/vzed`), because
 the server doesn't know which folder your agent was opened in.
@@ -217,7 +219,8 @@ for a more specific file.
 Rebuild (`v -o bin/v-mcp-server -no-parallel .`) and force the client to
 re-spawn the binary — touch the config file or run <code>/mcps</code>.
 A failed spawn can leave the connection marked failed until a fresh
-connect.
+connect. To see which build is actually running, ask the agent for
+<code>v_server_info</code> (name, version, build timestamp).
 </details>
 
 ## Notes for the curious

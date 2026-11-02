@@ -1,9 +1,10 @@
 // v-mcp-server
 // An MCP (Model Context Protocol) server that exposes V development tooling
 // to coding agents: program compilation and execution, structured build
-// errors, test runs, formatting checks, vet warnings, AST dumps, symbol
-// outlines, repo briefs, v.mod inspection, affected-test selection and
-// who-uses-what queries (definitions, callers, interface implementations).
+// errors, test runs, formatting checks (verify and in-place fix), vet
+// warnings, AST dumps, symbol outlines, repo briefs, v.mod inspection,
+// affected-test selection, who-uses-what queries (definitions, callers,
+// interface implementations) and a server build/info report.
 //
 // Built on the official `mcp` module of the V standard library; serves
 // over stdio (newline-delimited JSON-RPC), the transport used by Claude
@@ -20,7 +21,7 @@ import gil_silva.vuses.vuses
 
 const server_name = 'v-mcp-server'
 
-const server_version = '0.4.0'
+const server_version = '0.5.0'
 
 // output_byte_limit caps any tool output, so agents never choke on
 // multi-megabyte AST dumps or test logs.
@@ -41,6 +42,17 @@ const v_affected_schema = '{"type":"object","properties":{"path":{"description":
 // smoke.vsh counts `"properties":{"path":{` occurrences server-wide.
 const v_run_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V file or project directory","type":"string"},"args":{"description":"Positional arguments passed to the compiled program (optional, JSON array of strings)","type":"array","items":{"type":"string"}}},"required":["path"],"additionalProperties":false}'
 
+// v_build_schema declares path as required and vflags as an optional list of
+// CLI flags forwarded verbatim to the v compiler (e.g. -g, -prod, -cc clang).
+// `path` must stay the first property — smoke.vsh counts
+// `"properties":{"path":{` occurrences server-wide.
+const v_build_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V file or project directory","type":"string"},"vflags":{"description":"Extra flags passed verbatim to the v CLI (optional, JSON array of strings, e.g. [\\"-prod\\"] or [\\"-cc\\",\\"clang\\"])","type":"array","items":{"type":"string"}}},"required":["path"],"additionalProperties":false}'
+
+// server_info_schema backs the no-argument v_server_info tool. It is the one
+// tool that intentionally declares no properties; smoke.vsh excludes it when
+// enforcing the `path`-property invariant of every other tool.
+const server_info_schema = '{"type":"object","properties":{},"additionalProperties":false}'
+
 // v_uses_schema declares path as required and symbol as an optional string
 // the tool itself validates; same `path`-first rule as every other schema.
 const v_uses_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V project directory to scan","type":"string"},"symbol":{"description":"The declared V symbol name to query (fn/method/struct/interface/enum/const/type name)","type":"string"}},"required":["path"],"additionalProperties":false}'
@@ -51,11 +63,20 @@ struct PathArgs {
 	path string
 }
 
+// BuildArgs is the payload of v_build: a path plus optional CLI flags
+// forwarded verbatim to the v compiler.
+struct BuildArgs {
+	path   string
+	vflags ?[]string
+}
+
 // RunArgs is the payload of v_run: path plus optional positional arguments
-// (argv) forwarded to the compiled program.
+// (argv) forwarded to the compiled program, and optional compiler flags for
+// the build step.
 struct RunArgs {
-	path string
-	args ?[]string
+	path   string
+	args   ?[]string
+	vflags ?[]string
 }
 
 // One compiler diagnostic, as emitted by `v` on the header line
@@ -86,6 +107,21 @@ struct UsesArgs {
 // decode_args parses a tool `arguments` JSON into T.
 fn decode_args[T](arguments string) !T {
 	return json2.decode[T](arguments, json2.DecoderOptions{})!
+}
+
+// validate_path rejects the two most common agent mistakes up front — a
+// relative path (the server does no path fixing and the agent's CWD isn't
+// ours) and a path that does not exist — instead of letting `v` produce a
+// cryptic stream about missing files. Every tool calls this right after
+// decoding its arguments.
+fn validate_path(path string) !string {
+	if !os.is_abs_path(path) {
+		return error('path must be ABSOLUTE (got "${path}"): the server does not fix relative paths')
+	}
+	if !os.exists(path) {
+		return error('path does not exist: ${path}')
+	}
+	return path
 }
 
 // tool_timeout_seconds caps any spawned `v` subcommand. The server processes
@@ -196,20 +232,34 @@ fn tmp_output_path(tag string) string {
 // ---- tools -----------------------------------------------------------------
 
 fn v_build_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
-	a := decode_args[PathArgs](arguments) or {
+	a := decode_args[BuildArgs](arguments) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
+	validate_path(a.path) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	flags := a.vflags or { []string{} }
 	checkout := tmp_output_path('build')
 	defer {
 		os.rm(checkout) or {}
 	}
-	return run_v_tool(['v', '-o', checkout, '-no-parallel', a.path])
+	mut pargs := []string{cap: 4 + flags.len}
+	pargs << 'v'
+	pargs << flags
+	pargs << '-o'
+	pargs << checkout
+	pargs << '-no-parallel'
+	pargs << a.path
+	return run_v_tool(pargs)
 }
 
 // ---- v_run: compile once, then execute the binary ---------------------------
 
 fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	a := decode_args[RunArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	validate_path(a.path) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
 	bin := tmp_output_path('run_target')
@@ -219,7 +269,15 @@ fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 
 	// Same failure contract as run_v_tool: an error result carrying whatever
 	// the compiler printed (or a fallback line when it printed nothing).
-	compile := run_capture(['v', '-o', bin, '-no-parallel', a.path])
+	flags := a.vflags or { []string{} }
+	mut cargs := []string{cap: 4 + flags.len}
+	cargs << 'v'
+	cargs << flags
+	cargs << '-o'
+	cargs << bin
+	cargs << '-no-parallel'
+	cargs << a.path
+	compile := run_capture(cargs)
 	mut build_log := merge_streams(compile.stdout, compile.stderr)
 	if compile.exit_code != 0 || compile.timed_out {
 		if build_log.len == 0 {
@@ -264,6 +322,9 @@ fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 
 fn v_errors_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	a := decode_args[PathArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	validate_path(a.path) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
 	bin := tmp_output_path('errors_target')
@@ -344,6 +405,9 @@ fn v_test_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	a := decode_args[PathArgs](arguments) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
+	validate_path(a.path) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
 	return run_v_tool(['v', '-no-parallel', 'test', a.path])
 }
 
@@ -351,12 +415,30 @@ fn v_fmt_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	a := decode_args[PathArgs](arguments) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
+	validate_path(a.path) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
 	// `v fmt -c` checks formatting without touching files (exit 1 if unformatted).
 	return run_v_tool(['v', 'fmt', '-c', a.path])
 }
 
+// v_fmt_fix_tool closes the formatting loop: it runs `v fmt -w`, which
+// rewrites the touched files in place (use v_fmt_check to only verify).
+fn v_fmt_fix_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[PathArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	validate_path(a.path) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	return run_v_tool(['v', 'fmt', '-w', a.path])
+}
+
 fn v_vet_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	a := decode_args[PathArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	validate_path(a.path) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
 	return run_v_tool(['v', 'vet', a.path])
@@ -364,6 +446,9 @@ fn v_vet_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 
 fn v_ast_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	a := decode_args[PathArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	validate_path(a.path) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
 	// `-p` prints the AST JSON to stdout instead of writing a sidecar file.
@@ -448,6 +533,9 @@ fn v_symbols_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	a := decode_args[PathArgs](arguments) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
+	validate_path(a.path) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
 	syms := symbols_from_file(a.path)
 	if syms.len == 0 {
 		return mcp.tool_text_result('(no symbols found in ${a.path}; only .v files with top-level declarations)')
@@ -463,6 +551,9 @@ fn v_symbols_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 
 fn v_deps_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	a := decode_args[PathArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	validate_path(a.path) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
 	vmod := os.join_path(a.path, 'v.mod')
@@ -486,6 +577,9 @@ fn v_repo_brief_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	a := decode_args[PathArgs](arguments) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
+	validate_path(a.path) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
 	out := vrepo.brief(a.path, vrepo.Budget{}) or {
 		return to_error_result('v_repo_brief: ${err.msg()}')
 	}
@@ -496,6 +590,9 @@ fn v_repo_brief_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 
 fn v_affected_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	a := decode_args[AffectedArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	validate_path(a.path) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
 	b := a.base or { 'HEAD' }
@@ -530,6 +627,9 @@ fn v_uses_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	a := decode_args[UsesArgs](arguments) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
+	validate_path(a.path) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
 	symbol := a.symbol.trim_space()
 	if symbol.len == 0 {
 		return to_error_result('v_uses: the "symbol" argument is required (the declared name to query, e.g. run_v_tool)')
@@ -540,22 +640,37 @@ fn v_uses_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	return mcp.tool_text_result(truncate(ix.report(a.path, symbol)))
 }
 
+// v_server_info_tool reports the running build: the name/version constants,
+// the @BUILD_TIMESTAMP baked into this binary at compile time, and the
+// version of the v toolchain behind it — enough to spot a stale re-spawn in
+// one call.
+fn v_server_info_tool(_ctx mcp.Context, _arguments string) !mcp.ToolResult {
+	ver := run_capture(['v', '-version'])
+	// @BUILD_TIMESTAMP bakes in as an epoch string; render it human-readable.
+	build_time := time.unix(@BUILD_TIMESTAMP.i64()).str()
+	mut out := '${server_name} ${server_version}\nbuilt at: ${build_time}'
+	if ver.exit_code == 0 {
+		out += '\n' + ver.stdout.trim_space()
+	}
+	return mcp.tool_text_result(out)
+}
+
 // ---- server wiring ----------------------------------------------------------
 
 fn new_vlang_server() !mcp.Server {
 	mut server := mcp.new_server(
 		name:         server_name
 		version:      server_version
-		instructions: 'V development server: compile, test, format-check, vet, dump AST JSON, outline symbols, inspect v.mod, brief a repo, run only affected tests, run a compiled program, list compiler diagnostics as JSON, and answer who-uses-what (definitions/callers/implementations of a declared symbol). PASS ABSOLUTE PATHS.'
+		instructions: 'V development server: compile, test, format-check and format in place, vet, dump AST JSON, outline symbols, inspect v.mod, brief a repo, run only affected tests, run a compiled program, list compiler diagnostics as JSON, answer who-uses-what, and report its own build (v_server_info). PASS ABSOLUTE PATHS.'
 	)
 	server.add_tool(mcp.Tool{
 		name:         'v_build'
-		description:  'Compile a V file or project (path) and return compiler diagnostics.'
-		input_schema: path_args_schema
+		description:  'Compile a V file or project (path) and return compiler diagnostics. Optional vflags (JSON array of strings) are forwarded verbatim to the v CLI (e.g. ["-prod"] or ["-cc","clang"]).'
+		input_schema: v_build_schema
 	}, v_build_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_run'
-		description:  'Compile path, then execute it. Optional args (JSON array of strings) are passed to the program. Returns the program output; compile failures return the compiler diagnostics as an error. Timeout and output caps apply.'
+		description:  'Compile path, then execute it. Optional args (JSON array of strings) are passed to the program; optional vflags (JSON array of strings) are forwarded to the compiler for the build. Returns the program output; compile failures return the compiler diagnostics as an error. Timeout and output caps apply.'
 		input_schema: v_run_schema
 	}, v_run_tool)!
 	server.add_tool(mcp.Tool{
@@ -570,9 +685,14 @@ fn new_vlang_server() !mcp.Server {
 	}, v_test_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_fmt_check'
-		description:  'Run `v fmt -c` (check-only) on a file or directory (path). Non-zero exit if unformatted.'
+		description:  'Run `v fmt -c` (check-only) on a file or directory (path). Non-zero exit if unformatted; use v_fmt to format in place.'
 		input_schema: path_args_schema
 	}, v_fmt_tool)!
+	server.add_tool(mcp.Tool{
+		name:         'v_fmt'
+		description:  'Run `v fmt -w` (format in place) on a file or directory (path). Mutates source files; use v_fmt_check to only verify.'
+		input_schema: path_args_schema
+	}, v_fmt_fix_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_vet'
 		description:  'Run `v vet` on a file or project (path) and return warnings.'
@@ -608,6 +728,11 @@ fn new_vlang_server() !mcp.Server {
 		description:  'Answer who-uses-what for a declared symbol: definitions (file:line per kind), call/constructor sites with the enclosing fn/method, and — when the symbol names an interface — approximated implementing types. Declared-name matching, comments and strings scrubbed. Text report, capped.'
 		input_schema: v_uses_schema
 	}, v_uses_tool)!
+	server.add_tool(mcp.Tool{
+		name:         'v_server_info'
+		description:  'Report the running server build: name, version, compile-time build timestamp and the underlying `v -version`. No arguments. Use this to spot a stale binary/connection.'
+		input_schema: server_info_schema
+	}, v_server_info_tool)!
 	return server
 }
 

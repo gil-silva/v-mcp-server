@@ -22,6 +22,7 @@ session := [
 	'{"jsonrpc":"2.0","method":"notifications/initialized"}',
 	'{"jsonrpc":"2.0","id":2,"method":"tools/list"}',
 	'{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"v_symbols","arguments":{"path":"${@VMODROOT}/main.v"}}}',
+	'{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"v_server_info"}}',
 ]
 for line in session {
 	p.stdin_write(line + '\n')
@@ -31,7 +32,7 @@ for line in session {
 // polling with the NON-blocking read (stdout_slurp waits for server EOF).
 mut out := ''
 deadline := time.now().add(20 * time.second)
-for time.now() < deadline && out.count('\n') < 3 {
+for time.now() < deadline && out.count('\n') < 4 {
 	time.sleep(100 * time.millisecond)
 	out += p.stdout_read()
 }
@@ -41,7 +42,8 @@ p.close()
 println(out.replace('\n', '\n--- '))
 
 checks := ['"id":1', '"protocolVersion"', '"v_build"', '"v_symbols"', '"v_repo_brief"', '"v_affected"',
-	'"v_run"', '"v_errors"', '"v_uses"', '"isError":false', 'server_name']
+	'"v_run"', '"v_errors"', '"v_uses"', '"v_fmt"', '"v_server_info"', '"id":4', 'built at:',
+	'"isError":false', 'server_name']
 mut ok := true
 for c in checks {
 	if !out.contains(c) {
@@ -50,14 +52,15 @@ for c in checks {
 	}
 }
 
-// Schema-validation guard: every tool must advertise the `path` property in
-// its inputSchema. Clients validate arguments against these schemas, so a
-// tool whose schema has no properties (the mcp module default) silently
-// receives no arguments. The path-only tools share one schema const;
-// `v_run` and `v_affected` declare their own consts with `path` first —
-// either way, the number of "name":"v_ entries must match the number of
-// path properties.
-n_tools := out.count('"name":"v_')
+// Schema-validation guard: every tool that takes arguments must advertise
+// the `path` property in its inputSchema. Clients validate arguments
+// against these schemas, so a tool whose schema has no properties (the mcp
+// module default) silently receives no arguments. The path-only tools share
+// one schema const; `v_run`, `v_build` and `v_affected` declare their own
+// consts with `path` first — either way, the number of "name":"v_ entries
+// (minus the no-argument v_server_info) must match the number of path
+// properties.
+n_tools := out.count('"name":"v_') - out.count('"name":"v_server_info"')
 n_props := out.count('"properties":{"path":{')
 if n_tools == 0 || n_props != n_tools {
 	eprintln('✗ inputSchema: ${n_props}/${n_tools} tools declare the path property')
