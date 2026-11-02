@@ -1,7 +1,8 @@
 // v-mcp-server
 // An MCP (Model Context Protocol) server that exposes V development tooling
-// to coding agents: build diagnostics, test runs, formatting checks, vet
-// warnings, AST dumps, symbol outlines and v.mod dependency inspection.
+// to coding agents: program compilation and execution, structured build
+// errors, test runs, formatting checks, vet warnings, AST dumps, symbol
+// outlines, repo briefs, v.mod inspection and affected-test selection.
 //
 // Built on the official `mcp` module of the V standard library; serves
 // over stdio (newline-delimited JSON-RPC), the transport used by Claude
@@ -79,13 +80,22 @@ fn decode_args[T](arguments string) !T {
 // interactive prompt) must not silently queue every other call behind it.
 const tool_timeout_seconds = 600
 
-// run_capture spawns args[0] with args[1..] and polls it like run_v_tool's
-// callers expect: no timed wait exists in v 0.5.2 (os.Process), so the child
-// is checked every 500 ms until tool_timeout_seconds (SIGTERM, then SIGKILL
-// after 3 s). Returns the two streams unmerged, plus exit state and the
-// timeout flag. Shared by run_v_tool, v_run and v_errors, which format the
-// result each in their own way.
-fn run_capture(args []string) (string, string, int, bool) {
+// Capture is everything run_capture learned about one child process: the
+// two output streams, unmerged (callers decide how to display them), the
+// exit code, and whether the tool timeout fired.
+struct Capture {
+	stdout    string
+	stderr    string
+	exit_code int
+	timed_out bool
+}
+
+// run_capture spawns args[0] with args[1..] and polls it to completion:
+// no timed wait exists in v 0.5.2 (os.Process), so the child is checked
+// every 500 ms until tool_timeout_seconds (SIGTERM first, then SIGKILL
+// after 3 s). Shared by run_v_tool, v_run and v_errors; each caller
+// formats the Capture its own way.
+fn run_capture(args []string) Capture {
 	mut p := os.new_process(args[0])
 	p.set_args(args[1..])
 	p.set_redirect_stdio()
@@ -106,13 +116,15 @@ fn run_capture(args []string) (string, string, int, bool) {
 		time.sleep(500 * time.millisecond)
 	}
 	p.wait() // reaps the (exited) child and sets p.code
-	stdout := p.stdout_slurp()
-	stderr := p.stderr_slurp()
-	exit_code := p.code
 	defer {
 		p.close()
 	}
-	return stdout, stderr, exit_code, timed_out
+	return Capture{
+		stdout:    p.stdout_slurp()
+		stderr:    p.stderr_slurp()
+		exit_code: p.code
+		timed_out: timed_out
+	}
 }
 
 // merge_streams joins captured stdout/stderr the way run_v_tool displays them.
@@ -127,14 +139,14 @@ fn merge_streams(stdout string, stderr string) string {
 // run_v_tool executes a `v` subcommand and wraps its output in an MCP tool
 // result. A non-zero exit code yields an error result carrying both streams.
 fn run_v_tool(args []string) mcp.ToolResult {
-	stdout, stderr, exit_code, timed_out := run_capture(args)
-	mut out := merge_streams(stdout, stderr)
-	if exit_code != 0 || timed_out {
+	c := run_capture(args)
+	mut out := merge_streams(c.stdout, c.stderr)
+	if c.exit_code != 0 || c.timed_out {
 		if out.len == 0 {
-			if timed_out {
+			if c.timed_out {
 				out = 'command timed out after ${tool_timeout_seconds} s'
 			} else {
-				out = 'command failed with exit code ${exit_code}'
+				out = 'command failed with exit code ${c.exit_code}'
 			}
 		}
 		return to_error_result(out)
@@ -181,36 +193,6 @@ fn v_build_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	return run_v_tool(['v', '-o', checkout, '-no-parallel', a.path])
 }
 
-fn v_test_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
-	a := decode_args[PathArgs](arguments) or {
-		return to_error_result('bad arguments: ${err.msg()}')
-	}
-	return run_v_tool(['v', '-no-parallel', 'test', a.path])
-}
-
-fn v_fmt_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
-	a := decode_args[PathArgs](arguments) or {
-		return to_error_result('bad arguments: ${err.msg()}')
-	}
-	// `v fmt -c` checks formatting without touching files (exit 1 if unformatted).
-	return run_v_tool(['v', 'fmt', '-c', a.path])
-}
-
-fn v_vet_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
-	a := decode_args[PathArgs](arguments) or {
-		return to_error_result('bad arguments: ${err.msg()}')
-	}
-	return run_v_tool(['v', 'vet', a.path])
-}
-
-fn v_ast_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
-	a := decode_args[PathArgs](arguments) or {
-		return to_error_result('bad arguments: ${err.msg()}')
-	}
-	// `-p` prints the AST JSON to stdout instead of writing a sidecar file.
-	return run_v_tool(['v', 'ast', '-p', a.path])
-}
-
 // ---- v_run: compile once, then execute the binary ---------------------------
 
 fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
@@ -224,39 +206,39 @@ fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 
 	// Same failure contract as run_v_tool: an error result carrying whatever
 	// the compiler printed (or a fallback line when it printed nothing).
-	bout, berr, bcode, btime_out := run_capture(['v', '-o', bin, '-no-parallel', a.path])
-	if bcode != 0 || btime_out {
-		mut btext := merge_streams(bout, berr)
-		if btext.len == 0 {
-			btext = if btime_out {
+	compile := run_capture(['v', '-o', bin, '-no-parallel', a.path])
+	mut build_log := merge_streams(compile.stdout, compile.stderr)
+	if compile.exit_code != 0 || compile.timed_out {
+		if build_log.len == 0 {
+			build_log = if compile.timed_out {
 				'build timed out after ${tool_timeout_seconds} s'
 			} else {
-				'build failed with exit code ${bcode}'
+				'build failed with exit code ${compile.exit_code}'
 			}
 		}
-		return to_error_result('v_run build failed:\n${btext}')
+		return to_error_result('v_run build failed:\n${build_log}')
 	}
-	blog := merge_streams(bout, berr)
 
 	args := a.args or { []string{} }
 	mut pargs := []string{cap: args.len + 1}
 	pargs << bin
 	pargs << args
-	stdout, stderr, code, timed_out := run_capture(pargs)
-	ptext := merge_streams(stdout, stderr)
+
+	prog := run_capture(pargs)
+	program_text := merge_streams(prog.stdout, prog.stderr)
 	mut parts := []string{}
-	if blog.len > 0 {
-		parts << 'compiler output:\n${blog}'
+	if build_log.len > 0 {
+		parts << 'compiler output:\n${build_log}'
 	}
-	if ptext.len > 0 {
-		parts << ptext
+	if program_text.len > 0 {
+		parts << program_text
 	}
-	if timed_out {
+	if prog.timed_out {
 		parts << 'program timed out after ${tool_timeout_seconds} s'
 		return to_error_result(truncate(parts.join('\n')))
 	}
-	if code != 0 {
-		parts << 'program exited with code ${code}'
+	if prog.exit_code != 0 {
+		parts << 'program exited with code ${prog.exit_code}'
 		return to_error_result(truncate(parts.join('\n')))
 	}
 	if parts.len == 0 {
@@ -275,16 +257,16 @@ fn v_errors_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	defer {
 		os.rm(bin) or {}
 	}
-	stdout, stderr, code, timed_out := run_capture(['v', '-o', bin, '-no-parallel', a.path])
-	text := merge_streams(stdout, stderr)
+	compile := run_capture(['v', '-o', bin, '-no-parallel', a.path])
+	text := merge_streams(compile.stdout, compile.stderr)
 	diags := parse_diagnostics(text)
-	if diags.len == 0 && (code != 0 || timed_out) {
+	if diags.len == 0 && (compile.exit_code != 0 || compile.timed_out) {
 		// Failed without parseable output; surface it raw instead of letting
 		// `[]` pass as "clean build".
-		fallback := if timed_out {
+		fallback := if compile.timed_out {
 			'build timed out after ${tool_timeout_seconds} s'
 		} else {
-			'build failed (exit ${code}) with no parseable diagnostics'
+			'build failed (exit ${compile.exit_code}) with no parseable diagnostics'
 		}
 		return to_error_result('v_errors: ${fallback}:\n${truncate(text)}')
 	}
@@ -343,6 +325,36 @@ fn diagnostic_kind(word string) string {
 	} else {
 		''
 	}
+}
+
+fn v_test_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[PathArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	return run_v_tool(['v', '-no-parallel', 'test', a.path])
+}
+
+fn v_fmt_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[PathArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	// `v fmt -c` checks formatting without touching files (exit 1 if unformatted).
+	return run_v_tool(['v', 'fmt', '-c', a.path])
+}
+
+fn v_vet_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[PathArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	return run_v_tool(['v', 'vet', a.path])
+}
+
+fn v_ast_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[PathArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	// `-p` prints the AST JSON to stdout instead of writing a sidecar file.
+	return run_v_tool(['v', 'ast', '-p', a.path])
 }
 
 // ---- v_symbols: a pure-V symbol outline (no subprocess) ---------------------
