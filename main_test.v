@@ -382,6 +382,12 @@ fn test_strip_ansi_drops_color_codes() {
 	colored := '\x1b[36m@@ -1,2 +1,2 @@\x1b[0m\x1b[31m-fn main(){\x1b[0m\n\x1b[32m+fn main() {\x1b[0m\n'
 	assert strip_ansi(colored) == '@@ -1,2 +1,2 @@-fn main(){\n+fn main() {\n', strip_ansi(colored)
 	assert strip_ansi('plain text 123') == 'plain text 123'
+	// truncated escapes (no final letter) are not sequences: copied
+	// verbatim, never a panic on a string ending mid-sequence
+	assert strip_ansi('\x1b') == '\x1b'
+	assert strip_ansi('\x1b[') == '\x1b['
+	assert strip_ansi('\x1b[31') == '\x1b[31'
+	assert strip_ansi('\x1b[31mOK\x1b[') == 'OK\x1b['
 }
 
 fn test_v_fmt_check_diff_round_trip() {

@@ -733,7 +733,8 @@ fn program_stdin_cmd(bin string, args []string, stdin_path string) []string {
 // run_built_program executes a freshly built (or cache-replayed) binary for
 // v_run and v_scratch. With stdin the program runs through a one-off temp
 // file (see program_stdin_cmd); without it, straight from the binary with
-// argv. Same exit-code and stream contract either way.
+// argv — a stdin-reading program sees EOF immediately (run_capture gives
+// every child /dev/null). Same exit-code and stream contract either way.
 fn run_built_program(bin string, args []string, stdin string, seconds int) !Capture {
 	if stdin != '' {
 		stdin_path := tmp_output_path('stdin')
@@ -1023,9 +1024,9 @@ fn parse_test_rows(text string) []TestRow {
 		} else if line.starts_with('FAIL ') {
 			kind = 'FAIL'
 		}
-		// unparsable lines between results are the failure context; a
-		// looking result line whose shape does not fit is junk, not
-		// context, and passes by without buffering
+		// a result-shaped line either parses into a row or is junk —
+		// dropped here, never buffered as failure context; every other
+		// line falls through to the context buffer below
 		if kind != '' {
 			sep := line.index(' | ') or { continue }
 			fields := line[..sep].trim_space().fields()
@@ -1166,9 +1167,9 @@ fn v_test_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	text := merge_streams(c.stdout, c.stderr)
 	rows := parse_test_rows(text)
 	if rows.len == 0 {
-		// nothing parseable: probe compilation failed, suite never ran, or
-		// the -stats shape changed — fall back to the raw view (plus a
-		// timeout note when the run hit the process cap)
+		// nothing parseable: the tests failed to compile, the suite never
+		// ran, or the -stats shape changed — fall back to the raw view
+		// (plus a timeout note when the run hit the process cap)
 		if c.exit_code != 0 || c.timed_out {
 			fallback := if c.timed_out {
 				'test run timed out after ${seconds} s'
@@ -1243,8 +1244,9 @@ fn v_gate_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 			text := merge_streams(tc.stdout, tc.stderr)
 			rows := parse_test_rows(text)
 			if rows.len == 0 {
-				// unparsable: probe compile failed, suite never started, or
-				// the -stats shape changed — the raw text is the detail
+				// nothing parseable: the tests failed to compile, the suite
+				// never started, or the -stats shape changed — the raw text
+				// is the detail
 				tests_section = GateSection{
 					ok:     tc.exit_code == 0 && !tc.timed_out
 					detail: if tc.timed_out {
@@ -1328,8 +1330,12 @@ fn strip_ansi(text string) string {
 			for j < text.len && (text[j].is_digit() || text[j] == `;` || text[j] == `?`) {
 				j++
 			}
-			is_letter := (text[j] >= `a` && text[j] <= `z`) || (text[j] >= `A` && text[j] <= `Z`)
-			if j < text.len && is_letter {
+			// a sequence runs to its final letter; anything less (output
+			// cut mid-sequence) is not a sequence — its bytes pass through
+			// verbatim. The bounds check gates the letter test: j can sit
+			// at text.len
+			if j < text.len
+				&& ((text[j] >= `a` && text[j] <= `z`) || (text[j] >= `A` && text[j] <= `Z`)) {
 				i = j + 1
 				continue
 			}
