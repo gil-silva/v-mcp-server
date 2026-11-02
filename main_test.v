@@ -131,7 +131,7 @@ fn test_v_repo_brief_call_round_trip() {
 		}) or { panic('tools/call: ${err.msg()}') }
 	assert !res.is_error, res.content
 	assert res.content.contains('vrepo brief — '), res.content
-	assert res.content.contains('module: vmcpserver 0.7.0 [MIT]'), res.content
+	assert res.content.contains('module: vmcpserver 0.8.0 [MIT]'), res.content
 	assert res.content.contains('entry points: main.v'), res.content
 }
 

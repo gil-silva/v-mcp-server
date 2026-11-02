@@ -12,7 +12,7 @@ A warm build cache rides along: identical sources, flags and toolchain skip
 the compiler entirely.
 
 [![CI](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-0.7.0-4a6b9e)
+![version](https://img.shields.io/badge/version-0.8.0-4a6b9e)
 ![vpm](https://img.shields.io/badge/vpm-gil--silva.vmcpserver-8a5f4a)
 ![license](https://img.shields.io/badge/license-MIT-3a8a5f)
 

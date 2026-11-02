@@ -24,7 +24,7 @@ import gil_silva.vuses.vuses
 
 const server_name = 'v-mcp-server'
 
-const server_version = '0.7.0'
+const server_version = '0.8.0'
 
 // output_byte_limit caps any tool output, so agents never choke on
 // multi-megabyte AST dumps or test logs.
