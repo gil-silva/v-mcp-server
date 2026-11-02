@@ -4,11 +4,14 @@
 
 **Give your coding agent real V powers.** Compile errors, structured
 diagnostics, program runs, in-place formatting, smart test selection, repo
-maps, module docs — over the
+maps, symbol source reads, v.mod project lookup, module docs — over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
+A warm build cache rides along: identical sources, flags and toolchain skip
+the compiler entirely.
+
 [![CI](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/gil-silva/v-mcp-server/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-0.6.0-4a6b9e)
+![version](https://img.shields.io/badge/version-0.7.0-4a6b9e)
 ![vpm](https://img.shields.io/badge/vpm-gil--silva.vmcpserver-8a5f4a)
 ![license](https://img.shields.io/badge/license-MIT-3a8a5f)
 
@@ -180,6 +183,15 @@ Open your agent in any V project and just ask normal things:
 > *"Is the vlang server you're using current?"*
 > → `v_server_info` — version, build timestamp and `v -version`, no arguments
 
+> *"Read just `parse_diagnostics`'s body, not the whole file."*
+> → `v_read` — the exact symbol source, with its line range in the file
+
+> *"Which V projects live under ~/vlang?"*
+> → `v_where` — every `v.mod` project beneath it, with each module's facts
+
+> *"Show me failing tests with timings as rows."*
+> → `v_test` with `stats:true` — `[{file,name,ok,ms,asserts}]`, detail trailing
+
 ## Token & time economy — by construction
 
 No benchmark inflation here: these are structural guarantees (caps and
@@ -195,15 +207,18 @@ one-call patterns), so the savings show up in your context every session.
 | shell-out: compile, then run, disentangle streams | `v_run` one call; compile failure vs runtime exit kept distinct, streams labeled | 1 round trip |
 | drop to the raw CLI for build flags (`-prod`, `-cc clang`) | `vflags` on `v_build`/`v_run`, passed verbatim to the v CLI | no shell detours |
 | a hung child wedges the whole tool queue | every spawned process capped at 600 s (SIGTERM → SIGKILL); calls keep flowing | never blocked |
+| rebuild after every edit call, waiting seconds each time | warm build cache: identical sources+flags+toolchain replay the stored build | compile seconds → ms |
+| read a whole file to see one function | `v_read` returns just that symbol's source, with its line range | N file reads → 1 |
+| dig through raw test text for the failures | `v_test` `stats:true` rows `[{file,name,ok,ms,asserts}]`, detail trailing | prose → data |
 
-## Tools reference (15 tools)
+## Tools reference (17 tools)
 
 | Tool          | Arguments | What it does |
 |---------------|-----------|--------------|
-| `v_build`     | `{path, vflags?}` | compiles and returns compiler diagnostics; optional `vflags` (JSON array of strings) is forwarded verbatim to the V CLI (e.g. `-g`, `-prod`, `-cc clang`, `-d flag`) |
-| `v_run`       | `{path, args?, vflags?}` | compiles `path`, executes the binary; optional `args` (JSON array of strings) become the program's argv, optional `vflags` are forwarded to the compiler, output returned with stdout/stderr labeled |
+| `v_build`     | `{path, vflags?}` | compiles and returns compiler diagnostics; optional `vflags` (JSON array of strings) is forwarded verbatim to the V CLI (e.g. `-g`, `-prod`, `-cc clang`, `-d flag`); warm-cached for identical inputs |
+| `v_run`       | `{path, args?, vflags?}` | compiles `path`, executes the binary (or the cached one); optional `args` (JSON array of strings) become the program's argv, optional `vflags` are forwarded to the compiler, output returned with stdout/stderr labeled |
 | `v_errors`    | `{path, vflags?}`  | compile-only; diagnostics as JSON `[{file,line,col,kind,message}]` — `[]` means clean; optional `vflags` mirror the `v_build` command |
-| `v_test`      | `{path, only?}` | runs `v test`; optional `only` is a test-function glob forwarded as `VTEST_ONLY_FN` (via `env(1)`) |
+| `v_test`      | `{path, only?, stats?}` | runs `v test`; optional `only` is a test-function glob forwarded as `VTEST_ONLY_FN` (via `env(1)`); optional `stats` returns structured rows `[{file,name,ok,ms,asserts}]` with the raw output trailing as failure detail |
 | `v_fmt_check` | `{path}`  | `v fmt -c` — check only, never touches files |
 | `v_fmt`       | `{path}`  | `v fmt -w` — format in place (mutates files) |
 | `v_vet`       | `{path}`  | `v vet` warnings |
@@ -214,6 +229,8 @@ one-call patterns), so the savings show up in your context every session.
 | `v_repo_brief`| `{path}`  | compact repo map: module identity, entry points, tree with LOC, per-file symbol outlines (~40k char cap) |
 | `v_affected`  | `{path, base?}` | `*_test.v` files a change can affect: git diff vs `base` (default `HEAD`), propagated through the static import graph |
 | `v_uses`      | `{path, symbol}` | who-uses-what for a declared symbol: definitions (`file:line` per kind), call/constructor sites with the enclosing fn/method, and — when the symbol names an interface — approximated implementing types; comments/strings scrubbed |
+| `v_read`      | `{path, symbol}` | the exact source of one declared symbol (path = a .v file), from its header to just before the next declaration, with its `file:line-range` |
+| `v_where`     | `{path}` | every V project (a folder holding a `v.mod`) under directory `path`, up to a few levels deep, each with its name/version/license/dependencies |
 | `v_server_info` | — | the running build: name, version, compile-time build timestamp, and the underlying `v -version` — one call to spot a stale binary |
 
 All tools expect **absolute** paths (e.g. `/home/you/vlang/vzed`), because
@@ -255,6 +272,11 @@ connect. To see which build is actually running, ask the agent for
 - Built on the official [`vlib/mcp`](https://github.com/vlang/v) module
   (protocol revision `2025-11-25` by default; stdlib handles switching).
 - stdout is reserved for the protocol; all logs go to stderr.
+- The warm build cache lives under `$TMPDIR/mcp_vlang_cache`, one entry per
+  distinct build key (toolchain version + realpath + vflags + content hashes
+  of the `.v` sources in scope and their `v.mod`). A hit means byte-equal
+  inputs — the compiler doesn't run. At server start the store is pruned to
+  the newest 16 entries (everything older than 14 days first).
 - The V mascot outside: **Veasel**, by
   [vlang/v-mascot](https://github.com/vlang/v-mascot)
   (CC [BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) — a
