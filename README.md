@@ -202,7 +202,7 @@ one-call patterns), so the savings show up in your context every session.
 |---------------|-----------|--------------|
 | `v_build`     | `{path, vflags?}` | compiles and returns compiler diagnostics; optional `vflags` (JSON array of strings) is forwarded verbatim to the V CLI (e.g. `-g`, `-prod`, `-cc clang`, `-d flag`) |
 | `v_run`       | `{path, args?, vflags?}` | compiles `path`, executes the binary; optional `args` (JSON array of strings) become the program's argv, optional `vflags` are forwarded to the compiler, output returned with stdout/stderr labeled |
-| `v_errors`    | `{path}`  | compile-only; diagnostics as JSON `[{file,line,col,kind,message}]` — `[]` means clean |
+| `v_errors`    | `{path, vflags?}`  | compile-only; diagnostics as JSON `[{file,line,col,kind,message}]` — `[]` means clean; optional `vflags` mirror the `v_build` command |
 | `v_test`      | `{path, only?}` | runs `v test`; optional `only` is a test-function glob forwarded as `VTEST_ONLY_FN` (via `env(1)`) |
 | `v_fmt_check` | `{path}`  | `v fmt -c` — check only, never touches files |
 | `v_fmt`       | `{path}`  | `v fmt -w` — format in place (mutates files) |

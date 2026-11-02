@@ -297,3 +297,35 @@ fn test_v_uses_call_round_trip() {
 	assert res2.is_error, res2.content
 	assert res2.content.contains('symbol'), res2.content
 }
+
+fn test_v_deps_multiline_round_trip() {
+	bin := compile_server()
+	defer {
+		os.rm(bin) or {}
+	}
+	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
+		panic('connect_stdio: ${err.msg()}')
+	}
+	defer {
+		client.close()
+	}
+	client.initialize()!
+	// a multiline dependencies list must stream past its first line
+	dir := os.join_path(os.temp_dir(), 'v_deps_multi_${os.getpid()}')
+	os.mkdir(dir)!
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	os.write_file(os.join_path(dir, 'v.mod'),
+		"Module {\n\tname: 'devmulti'\n\tversion: '0.0.1'\n\tdependencies: [\n\t\t'https://example.com/a',\n\t\t'https://example.com/b'\n\t]\n}\n")!
+	res := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_deps'
+			arguments: {
+				'path': json2.Any(dir)
+			}
+		}) or { panic('tools/call v_deps: ${err.msg()}') }
+	assert !res.is_error, res.content
+	assert res.content.contains('example.com/a'), res.content
+	assert res.content.contains('example.com/b'), res.content
+}

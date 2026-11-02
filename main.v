@@ -126,14 +126,13 @@ fn decode_args[T](arguments string) !T {
 // ours) and a path that does not exist — instead of letting `v` produce a
 // cryptic stream about missing files. Every tool calls this right after
 // decoding its arguments.
-fn validate_path(path string) !string {
+fn validate_path(path string) ! {
 	if !os.is_abs_path(path) {
 		return error('path must be ABSOLUTE (got "${path}"): the server does not fix relative paths')
 	}
 	if !os.exists(path) {
 		return error('path does not exist: ${path}')
 	}
-	return path
 }
 
 // tool_timeout_seconds caps any spawned `v` subcommand. The server processes
@@ -191,8 +190,8 @@ fn run_capture(args []string) Capture {
 // merge_streams joins captured stdout/stderr the way run_v_tool displays them.
 fn merge_streams(stdout string, stderr string) string {
 	mut out := stdout
-	if stderr.len > 0 {
-		out += if out.len > 0 { '\n' } else { '' } + stderr
+	if stderr != '' {
+		out += if out != '' { '\n' } else { '' } + stderr
 	}
 	return out.trim_space()
 }
@@ -228,17 +227,35 @@ fn to_error_result(text string) mcp.ToolResult {
 }
 
 // truncate caps long tool outputs; agents chunk better than they download.
+// The cut backs off to a UTF-8 boundary so the tail never starts mid-rune.
 fn truncate(text string) string {
 	if text.len <= output_byte_limit {
 		return text
 	}
-	return text[..output_byte_limit] + '\n... [truncated; ${text.len} bytes total]'
+	mut cut := output_byte_limit
+	for cut > 0 && (text[cut] & 0xC0) == 0x80 {
+		cut--
+	}
+	return text[..cut] + '\n... [truncated; ${text.len} bytes total]'
 }
 
 // tmp_output_path returns a unique absolute path for a temp build output.
 fn tmp_output_path(tag string) string {
 	return os.join_path(os.temp_dir(),
 		'mcp_vlang_${tag}_${os.getpid()}_${time.now().unix().str()}_random_1')
+}
+
+// compile_args assembles the v compile invocation shared by v_build, v_run
+// and v_errors: optional vflags first, then the temp output and the target.
+fn compile_args(bin string, path string, flags []string) []string {
+	mut cargs := []string{cap: 4 + flags.len}
+	cargs << 'v'
+	cargs << flags
+	cargs << '-o'
+	cargs << bin
+	cargs << '-no-parallel'
+	cargs << path
+	return cargs
 }
 
 // ---- tools -----------------------------------------------------------------
@@ -255,14 +272,7 @@ fn v_build_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	defer {
 		os.rm(checkout) or {}
 	}
-	mut pargs := []string{cap: 4 + flags.len}
-	pargs << 'v'
-	pargs << flags
-	pargs << '-o'
-	pargs << checkout
-	pargs << '-no-parallel'
-	pargs << a.path
-	return run_v_tool(pargs)
+	return run_v_tool(compile_args(checkout, a.path, flags))
 }
 
 // ---- v_run: compile once, then execute the binary ---------------------------
@@ -282,14 +292,7 @@ fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	// Same failure contract as run_v_tool: an error result carrying whatever
 	// the compiler printed (or a fallback line when it printed nothing).
 	flags := a.vflags or { []string{} }
-	mut cargs := []string{cap: 4 + flags.len}
-	cargs << 'v'
-	cargs << flags
-	cargs << '-o'
-	cargs << bin
-	cargs << '-no-parallel'
-	cargs << a.path
-	compile := run_capture(cargs)
+	compile := run_capture(compile_args(bin, a.path, flags))
 	mut build_log := merge_streams(compile.stdout, compile.stderr)
 	if compile.exit_code != 0 || compile.timed_out {
 		if build_log.len == 0 {
@@ -335,7 +338,7 @@ fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 // ---- v_errors: compile-only, structured diagnostics -------------------------
 
 fn v_errors_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
-	a := decode_args[PathArgs](arguments) or {
+	a := decode_args[BuildArgs](arguments) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
 	validate_path(a.path) or {
@@ -345,7 +348,8 @@ fn v_errors_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	defer {
 		os.rm(bin) or {}
 	}
-	compile := run_capture(['v', '-o', bin, '-no-parallel', a.path])
+	flags := a.vflags or { []string{} }
+	compile := run_capture(compile_args(bin, a.path, flags))
 	text := merge_streams(compile.stdout, compile.stderr)
 	diags := parse_diagnostics(text)
 	if diags.len == 0 && (compile.exit_code != 0 || compile.timed_out) {
@@ -597,12 +601,30 @@ fn v_deps_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	content := os.read_file(vmod) or {
 		return to_error_result('no v.mod in ${a.path}: ${err.msg()}')
 	}
+	// A multiline `dependencies: [...]` leaks into continuation lines, so the
+	// dependencies field streams until its closing bracket instead of
+	// matching just the four well-known prefixes.
+	lines := content.split_into_lines()
 	mut fields := []string{}
-	for raw_line in content.split_into_lines() {
-		line := raw_line.trim_space()
-		if line.starts_with('name:') || line.starts_with('version:')
-			|| line.starts_with('license:') || line.starts_with('dependencies') {
+	mut i := 0
+	for i < lines.len {
+		mut line := lines[i].trim_space()
+		if line.starts_with('name:') || line.starts_with('version:') || line.starts_with('license:') {
 			fields << line
+			i++
+		} else if line.starts_with('dependencies') {
+			fields << line
+			for !line.ends_with(']') {
+				i++
+				if i >= lines.len {
+					break
+				}
+				line = lines[i].trim_space()
+				fields << line
+			}
+			i++
+		} else {
+			i++
 		}
 	}
 	return mcp.tool_text_result(fields.join('\n'))
@@ -712,8 +734,8 @@ fn new_vlang_server() !mcp.Server {
 	}, v_run_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_errors'
-		description:  'Compile only; return compiler diagnostics as JSON [{file,line,col,kind,message}] with kind error/warning/note. An empty array means the build is clean.'
-		input_schema: path_args_schema
+		description:  'Compile only; return compiler diagnostics as JSON [{file,line,col,kind,message}] with kind error/warning/note. An empty array means the build is clean. Optional vflags (JSON array of strings) are forwarded to the compiler, mirroring the v_build command.'
+		input_schema: v_build_schema
 	}, v_errors_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_test'
