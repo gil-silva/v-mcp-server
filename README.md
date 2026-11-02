@@ -126,6 +126,7 @@ Open your agent in any V project and just ask normal things:
 | `v_symbols`   | `{path}`  | outline of fns/structs/interfaces/enums/consts/types + line numbers |
 | `v_deps`      | `{path}`  | name/version/license/dependencies from `v.mod` |
 | `v_repo_brief`| `{path}`  | compact repo map: module identity, entry points, tree with LOC, per-file symbol outlines (~40k char cap) |
+| `v_affected`  | `{path, base?}` | `*_test.v` files a change can affect: git diff vs `base` (default `HEAD`), propagated through the static import graph |
 
 All tools expect **absolute** paths (e.g. `/home/you/vlang/vzed`), because
 the server doesn't know which folder your agent was opened in.

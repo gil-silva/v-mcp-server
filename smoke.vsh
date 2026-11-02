@@ -40,7 +40,7 @@ p.close()
 
 println(out.replace('\n', '\n--- '))
 
-checks := ['"id":1', '"protocolVersion"', '"v_build"', '"v_symbols"', '"v_repo_brief"',
+checks := ['"id":1', '"protocolVersion"', '"v_build"', '"v_symbols"', '"v_repo_brief"', '"v_affected"',
 	'"isError":false', 'server_name']
 mut ok := true
 for c in checks {

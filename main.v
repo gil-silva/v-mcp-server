@@ -13,6 +13,7 @@ import json2
 import os
 import time
 import gil_silva.vrepo.vrepo
+import gil_silva.vaffected.vaffected
 
 const server_name = 'v-mcp-server'
 
@@ -28,10 +29,21 @@ const output_byte_limit = 100_000
 // the bare default schema makes clients drop all arguments.
 const path_args_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V file or project directory","type":"string"}},"required":["path"],"additionalProperties":false}'
 
+// v_affected_schema declares path as required and base as optional; without
+// base the tool diffs against HEAD.
+const v_affected_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V project directory","type":"string"},"base":{"description":"Git rev to diff against (default: HEAD)","type":"string"}},"required":["path"],"additionalProperties":false}'
+
 // PathArgs is the common `arguments` payload of the tools below:
 // a path to a single .v file or a project directory.
 struct PathArgs {
 	path string
+}
+
+// AffectedArgs is the payload of v_affected: path plus the optional git rev
+// to diff against ('HEAD' when absent).
+struct AffectedArgs {
+	path string
+	base ?string
 }
 
 // decode_args parses a tool `arguments` JSON into T.
@@ -285,13 +297,45 @@ fn v_repo_brief_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	return mcp.tool_text_result(truncate(out))
 }
 
+// ---- v_affected: run-only-what-a-change-can-affect via the vaffected lib ----
+
+fn v_affected_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[AffectedArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	b := a.base or { 'HEAD' }
+	base := if b.len > 0 { b } else { 'HEAD' }
+
+	// Changed paths come from git, relative to a.path; the library receives
+	// them as plain data (same contract its CLI uses).
+	git := os.exec(['git', '-C', a.path, 'diff', '--name-only', base])
+	if git.exit_code != 0 {
+		return to_error_result('v_affected: git diff failed: ${git.output.trim_space()}')
+	}
+	mut changed := []string{}
+	for row in git.output.split('\n') {
+		mut p := row.trim_space()
+		if p.starts_with('"') {
+			p = p.trim_left('"').trim_right('"')
+		}
+		if p.len > 0 && p.ends_with('.v') {
+			changed << p
+		}
+	}
+	out := vaffected.affected_report(a.path, changed) or {
+		return to_error_result('v_affected: ${err.msg()}')
+	}
+	text := if out.len == 0 { 'no affected tests (nothing to re-run)' } else { out }
+	return mcp.tool_text_result(truncate(text))
+}
+
 // ---- server wiring ----------------------------------------------------------
 
 fn new_vlang_server() !mcp.Server {
 	mut server := mcp.new_server(
 		name:         server_name
 		version:      server_version
-		instructions: 'V development server: compile, test, format-check, vet, dump AST JSON, outline symbols, inspect v.mod, brief a repo. PASS ABSOLUTE PATHS.'
+		instructions: 'V development server: compile, test, format-check, vet, dump AST JSON, outline symbols, inspect v.mod, brief a repo, run only affected tests. PASS ABSOLUTE PATHS.'
 	)
 	server.add_tool(mcp.Tool{
 		name:         'v_build'
@@ -333,6 +377,11 @@ fn new_vlang_server() !mcp.Server {
 		description:  'Generate a compact token-efficient repo brief (module identity, entry points, file tree with LOC, per-file symbol outlines) of a V project directory (path). Deterministic; capped at ~40k chars.'
 		input_schema: path_args_schema
 	}, v_repo_brief_tool)!
+	server.add_tool(mcp.Tool{
+		name:         'v_affected'
+		description:  'List the *_test.v files a change can affect: diffs path against the optional git rev base (default HEAD) and propagates changed files backwards through the static import graph. Empty result means nothing to re-run.'
+		input_schema: v_affected_schema
+	}, v_affected_tool)!
 	return server
 }
 

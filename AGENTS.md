@@ -127,9 +127,10 @@ V-specific rules. Full reference: `../v-release-052/v/AGENTS.md`.
 
 `bin/v-mcp-server` is the stdio MCP server this repo builds, and coding agents
 running in this workspace are expected to use it instead of spawning `v`
-directly. It exposes eight tools, each taking one absolute `path`:
+directly. It exposes nine tools, each taking an absolute `path`:
 `v_build`, `v_test`, `v_fmt_check`, `v_vet`, `v_ast`, `v_symbols`, `v_deps`,
-`v_repo_brief` (the last one maps V repos via the `vrepo` library).
+`v_repo_brief` (maps a V repo via the `vrepo` library) and `v_affected`
+(affected-test set via the `vaffected` library; optional `base` git rev).
 
 - OpenCode registers it globally as `vlang` in `~/.config/opencode/opencode.json`.
   Under Code Mode, call its tools from `execute`:
