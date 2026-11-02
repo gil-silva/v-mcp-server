@@ -22,6 +22,12 @@ const server_version = '0.2.0'
 // multi-megabyte AST dumps or test logs.
 const output_byte_limit = 100_000
 
+// path_args_schema is the shared inputSchema of the tools that take only a
+// path. Clients validate tool arguments against this schema, so declaring
+// `properties` (and `required`) is what lets the `path` argument through;
+// the bare default schema makes clients drop all arguments.
+const path_args_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V file or project directory","type":"string"}},"required":["path"],"additionalProperties":false}'
+
 // PathArgs is the common `arguments` payload of the tools below:
 // a path to a single .v file or a project directory.
 struct PathArgs {
@@ -288,36 +294,44 @@ fn new_vlang_server() !mcp.Server {
 		instructions: 'V development server: compile, test, format-check, vet, dump AST JSON, outline symbols, inspect v.mod, brief a repo. PASS ABSOLUTE PATHS.'
 	)
 	server.add_tool(mcp.Tool{
-		name:        'v_build'
-		description: 'Compile a V file or project (path) and return compiler diagnostics.'
+		name:         'v_build'
+		description:  'Compile a V file or project (path) and return compiler diagnostics.'
+		input_schema: path_args_schema
 	}, v_build_tool)!
 	server.add_tool(mcp.Tool{
-		name:        'v_test'
-		description: 'Run `v test` on a file or project (path) and return results.'
+		name:         'v_test'
+		description:  'Run `v test` on a file or project (path) and return results.'
+		input_schema: path_args_schema
 	}, v_test_tool)!
 	server.add_tool(mcp.Tool{
-		name:        'v_fmt_check'
-		description: 'Run `v fmt -c` (check-only) on a file or directory (path). Non-zero exit if unformatted.'
+		name:         'v_fmt_check'
+		description:  'Run `v fmt -c` (check-only) on a file or directory (path). Non-zero exit if unformatted.'
+		input_schema: path_args_schema
 	}, v_fmt_tool)!
 	server.add_tool(mcp.Tool{
-		name:        'v_vet'
-		description: 'Run `v vet` on a file or project (path) and return warnings.'
+		name:         'v_vet'
+		description:  'Run `v vet` on a file or project (path) and return warnings.'
+		input_schema: path_args_schema
 	}, v_vet_tool)!
 	server.add_tool(mcp.Tool{
-		name:        'v_ast'
-		description: 'Dump the AST JSON of a V file (path) via `v ast -p`. Output capped.'
+		name:         'v_ast'
+		description:  'Dump the AST JSON of a V file (path) via `v ast -p`. Output capped.'
+		input_schema: path_args_schema
 	}, v_ast_tool)!
 	server.add_tool(mcp.Tool{
-		name:        'v_symbols'
-		description: 'List top-level symbols (fn/method/struct/interface/enum/const/type + line numbers) of a .v file (path).'
+		name:         'v_symbols'
+		description:  'List top-level symbols (fn/method/struct/interface/enum/const/type + line numbers) of a .v file (path).'
+		input_schema: path_args_schema
 	}, v_symbols_tool)!
 	server.add_tool(mcp.Tool{
-		name:        'v_deps'
-		description: 'Read name/version/license/dependencies from the v.mod of a project (path).'
+		name:         'v_deps'
+		description:  'Read name/version/license/dependencies from the v.mod of a project (path).'
+		input_schema: path_args_schema
 	}, v_deps_tool)!
 	server.add_tool(mcp.Tool{
-		name:        'v_repo_brief'
-		description: 'Generate a compact token-efficient repo brief (module identity, entry points, file tree with LOC, per-file symbol outlines) of a V project directory (path). Deterministic; capped at ~40k chars.'
+		name:         'v_repo_brief'
+		description:  'Generate a compact token-efficient repo brief (module identity, entry points, file tree with LOC, per-file symbol outlines) of a V project directory (path). Deterministic; capped at ~40k chars.'
+		input_schema: path_args_schema
 	}, v_repo_brief_tool)!
 	return server
 }
