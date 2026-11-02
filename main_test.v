@@ -71,6 +71,7 @@ fn test_compile_and_handshake() {
 	assert names.contains('v_uses'), names.str()
 	assert names.contains('v_read'), names.str()
 	assert names.contains('v_where'), names.str()
+	assert names.contains('v_scratch'), names.str()
 }
 
 fn test_v_repo_brief_call_round_trip() {
@@ -280,6 +281,112 @@ fn test_v_run_and_v_errors_round_trips() {
 	assert res5.content.contains('program stdout:\\nping\\npong'), res5.content
 }
 
+fn test_v_scratch_and_timeout_round_trips() {
+	bin := compile_server()
+	defer {
+		os.rm(bin) or {}
+	}
+	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
+		panic('connect_stdio: ${err.msg()}')
+	}
+	defer {
+		client.close()
+	}
+	client.initialize()!
+
+	// a complete standalone program compiles and runs, output labeled
+	// exactly like v_run (content is JSON-wrapped: newlines arrive escaped)
+	res := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_scratch'
+			arguments: {
+				'code': json2.Any('fn main() {\n\tprintln("ping")\n\tprintln("pong")\n}\n')
+			}
+		}) or { panic('tools/call v_scratch: ${err.msg()}') }
+	assert !res.is_error, res.content
+	assert res.content.contains('program stdout:\\nping\\npong'), res.content
+
+	// stdin rides the same temp-file wrapper v_run uses, EOF closed
+	res2 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_scratch'
+			arguments: {
+				'code':  json2.Any("import os\n\nfn main() {\n\tmut all := ''\n\tfor {\n\t\tline := os.get_raw_line()\n\t\tif line.len == 0 {\n\t\t\tbreak\n\t\t}\n\t\tall += line\n\t}\n\tprint(all)\n}\n")
+				'stdin': json2.Any('ping\npong\n')
+			}
+		}) or { panic('tools/call v_scratch stdin: ${err.msg()}') }
+	assert !res2.is_error, res2.content
+	assert res2.content.contains('program stdout:\\nping\\npong'), res2.content
+
+	// snippets that do not compile come back labeled like v_run build
+	// failures (a bare `tmp := 1` is a legit script-mode success — a
+	// warning only — so the probe needs a real checker error)
+	res3 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_scratch'
+			arguments: {
+				'code': json2.Any('println(undefined_name_xyz)\n')
+			}
+		}) or { panic('tools/call v_scratch failing snippet: ${err.msg()}') }
+	assert res3.is_error, res3.content
+	assert res3.content.contains('v_scratch build failed'), res3.content
+
+	// the identical failing snippet is cache-keyed: the repeat call replays
+	// the stored record and fails exactly the same
+	res4 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_scratch'
+			arguments: {
+				'code': json2.Any('println(undefined_name_xyz)\n')
+			}
+		}) or { panic('tools/call v_scratch repeat: ${err.msg()}') }
+	assert res4.is_error, res4.content
+	assert res4.content == res3.content, 'cache replay kept the message: ${res4.content}'
+
+	// v_run's timeout override: a sleeping program is killed at its own cap
+	// and the label names that cap, not the server default
+	probe := os.join_path(os.temp_dir(), 'v_run_timeout_probe_${os.getpid()}.v')
+	os.write_file(probe, 'import time\n\nfn main() {\n\ttime.sleep(30 * time.second)\n}\n')!
+	defer {
+		os.rm(probe) or {}
+	}
+	res5 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_run'
+			arguments: {
+				'path':    json2.Any(probe)
+				'timeout': json2.Any(2)
+			}
+		}) or { panic('tools/call v_run timeout: ${err.msg()}') }
+	assert res5.is_error, res5.content
+	assert res5.content.contains('program timed out after 2 s'), res5.content
+
+	// out-of-range overrides are refused before anything spawns
+	res6 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_run'
+			arguments: {
+				'path':    json2.Any(probe)
+				'timeout': json2.Any(0)
+			}
+		}) or { panic('tools/call v_run timeout 0: ${err.msg()}') }
+	assert res6.is_error, res6.content
+	assert res6.content.contains('bad arguments'), res6.content
+	assert res6.content.contains('timeout: 0 s must be between 1 and 1800'), res6.content
+
+	// same cap on v_test, same refusal
+	res7 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_test'
+			arguments: {
+				'path':    json2.Any(@VMODROOT)
+				'timeout': json2.Any(5000)
+			}
+		}) or { panic('tools/call v_test timeout 5000: ${err.msg()}') }
+	assert res7.is_error, res7.content
+	assert res7.content.contains('timeout: 5000 s must be between 1 and 1800'), res7.content
+}
+
 fn test_v_uses_call_round_trip() {
 	bin := compile_server()
 	defer {
@@ -373,6 +480,25 @@ fn test_validate_vflags() {
 	rejected = false
 	validate_vflags(['']) or { rejected = true }
 	assert rejected, 'empty flag must be rejected'
+}
+
+fn test_resolve_timeout() {
+	t_none := resolve_timeout(none)!
+	assert t_none == tool_timeout_seconds, 'no override yields the server default, got ${t_none}'
+	t_2 := resolve_timeout(2)!
+	assert t_2 == 2, 'a plain call override passes through, got ${t_2}'
+	t_max := resolve_timeout(tool_timeout_seconds_max)!
+	assert t_max == tool_timeout_seconds_max, 'the max itself is accepted'
+	// out of range, below and above, is refused rather than quietly adjusted
+	mut rejected := false
+	resolve_timeout(0) or { rejected = true }
+	assert rejected, '0 must be rejected'
+	rejected = false
+	resolve_timeout(-3) or { rejected = true }
+	assert rejected, 'negative caps must be rejected'
+	rejected = false
+	resolve_timeout(tool_timeout_seconds_max + 1) or { rejected = true }
+	assert rejected, 'above the max must be rejected'
 }
 
 fn test_validate_filter() {
@@ -682,6 +808,16 @@ fn test_build_cache_key_determinism_and_scope() {
 	assert fkey1 != key1
 	os.write_file(os.join_path(dir, 'main.v'), 'fn main() {\n\tprintln(4)\n}\n')!
 	assert build_cache_key(file, []) == fkey1, 'file key ignores sibling content'
+}
+
+fn test_scratch_source_path() {
+	a := scratch_source_path('fn main() {\n\tprintln(1)\n}\n')
+	b := scratch_source_path('fn main() {\n\tprintln(1)\n}\n')
+	c := scratch_source_path('fn main() {\n\tprintln(2)\n}\n')
+	assert a == b, 'identical snippets are content-addressed to one file: ${a}'
+	assert a != c, 'distinct snippets never share a name: ${a} vs ${c}'
+	assert a.contains('v-mcp-scratch-'), 'snippets live in the per-process scratch dir: ${a}'
+	assert a.ends_with('.v'), a
 }
 
 fn test_cache_save_and_load_round_trip() {

@@ -52,18 +52,18 @@ for c in checks {
 	}
 }
 
-// Schema-validation guard: every tool that takes arguments must advertise
-// the `path` property in its inputSchema. Clients validate arguments
+// Schema-validation guard: every tool that takes arguments must advertise a
+// non-empty properties map in its inputSchema. Clients validate arguments
 // against these schemas, so a tool whose schema has no properties (the mcp
-// module default) silently receives no arguments. The path-only tools share
-// one schema const; `v_run`, `v_build` and `v_affected` declare their own
-// consts with `path` first — either way, the number of "name":"v_ entries
-// (minus the no-argument v_server_info) must match the number of path
-// properties.
+// module default) silently receives no arguments. Almost every tool requires
+// `path` (the shared const covers the path-only ones; the rest declare their
+// own consts with `path` first); the projectless v_scratch is the exception,
+// requiring `code`. The "name":"v_ entry count (minus the no-argument
+// v_server_info) must equal the combined first-property count.
 n_tools := out.count('"name":"v_') - out.count('"name":"v_server_info"')
-n_props := out.count('"properties":{"path":{')
+n_props := out.count('"properties":{"path":{') + out.count('"properties":{"code":{')
 if n_tools == 0 || n_props != n_tools {
-	eprintln('✗ inputSchema: ${n_props}/${n_tools} tools declare the path property')
+	eprintln('✗ inputSchema: ${n_props}/${n_tools} tools declare their first property')
 	ok = false
 }
 println(if ok { '✓ smoke passed' } else { '✗ smoke FAILED' })

@@ -161,6 +161,12 @@ Open your agent in any V project and just ask normal things:
 > *"Run my program with these two seeds and show me what it prints."*
 > → `v_run` — one call: compile, execute, labeled stdout/stderr
 
+> *"How does V actually resolve this option/result edge case?"*
+> → `v_scratch` with `code` — a standalone snippet compiled and run, fenced off from your project
+
+> *"This suite is huge — don't kill it halfway."*
+> → `timeout` on `v_run`/`v_test`/`v_errors` — a bigger per-call cap (1..1800 s, default 600)
+
 > *"Format every file you touched."*
 > → `v_fmt` — closes the loop `v_fmt_check` opens (it only verifies)
 
@@ -212,19 +218,21 @@ one-call patterns), so the savings show up in your context every session.
 | fuzzy prose errors, re-read the whole file | `v_errors` JSON rows: `{file,line,col,kind,message}` | seek-style edits |
 | shell-out: compile, then run, disentangle streams | `v_run` one call; compile failure vs runtime exit kept distinct, streams labeled | 1 round trip |
 | drop to the raw CLI for build flags (`-prod`, `-cc clang`) | `vflags` on `v_build`/`v_run`, passed verbatim to the v CLI | no shell detours |
-| a hung child wedges the whole tool queue | every spawned process capped at 600 s (SIGTERM → SIGKILL); calls keep flowing | never blocked |
+| a hung child wedges the whole tool queue | every spawned process capped at 600 s (SIGTERM → SIGKILL); calls keep flowing; a call can raise its own cap with `timeout` (≤ 1800 s) | never blocked |
+| guess V language semantics from memory, ship the bug | `v_scratch` compiles & runs a standalone snippet plain — no project wrap | verified answers, 1 call |
 | rebuild after every edit call, waiting seconds each time | warm build cache: identical sources+flags+toolchain replay the stored build | compile seconds → ms |
 | read a whole file to see one function | `v_read` returns just that symbol's source, with its line range | N file reads → 1 |
 | dig through raw test text for the failures | `v_test` `stats:true` rows `[{file,name,ok,ms,asserts}]`, detail trailing | prose → data |
 
-## Tools reference (17 tools)
+## Tools reference (18 tools)
 
 | Tool          | Arguments | What it does |
 |---------------|-----------|--------------|
 | `v_build`     | `{path, vflags?}` | compiles and returns compiler diagnostics; optional `vflags` (JSON array of strings) is forwarded verbatim to the V CLI (e.g. `-g`, `-prod`, `-cc clang`, `-d flag`); warm-cached for identical inputs |
-| `v_run`       | `{path, args?, stdin?, vflags?}` | compiles `path`, executes the binary (or the cached one); optional `args` (JSON array of strings) become the program's argv, optional `stdin` (string) is piped to the program verbatim (no trailing newline added, EOF afterwards), optional `vflags` are forwarded to the compiler, output returned with stdout/stderr labeled |
-| `v_errors`    | `{path, vflags?}`  | compile-only; diagnostics as JSON `[{file,line,col,kind,message}]` — `[]` means clean; optional `vflags` mirror the `v_build` command |
-| `v_test`      | `{path, only?, files?, stats?}` | runs `v test`; optional `only` is a test-function glob forwarded as `VTEST_ONLY_FN` (via `env(1)`); optional `files` is a test-file filter forwarded as `VTEST_ONLY` — comma-separated patterns matched as substrings of each test file's path relative to `path`, pairing with the `v_affected` output; optional `stats` returns structured rows `[{file,name,ok,ms,asserts}]` with the raw output trailing as failure detail |
+| `v_run`       | `{path, args?, stdin?, timeout?, vflags?}` | compiles `path`, executes the binary (or the cached one); optional `args` (JSON array of strings) become the program's argv, optional `stdin` (string) is piped to the program verbatim (no trailing newline added, EOF afterwards), optional `timeout` (integer seconds, 1..1800, default 600) raises each step's cap, optional `vflags` are forwarded to the compiler, output returned with stdout/stderr labeled |
+| `v_scratch`   | `{code, stdin?, vflags?}` | compiles and runs a standalone snippet, no project scaffolding — `code` is the complete source, a program with `fn main` or plain top-level statements (V script mode); optional `stdin` piped verbatim (no trailing newline, EOF afterwards), optional `vflags` to the compiler; identical snippets replay the warm cache; failure contract identical to `v_run` |
+| `v_errors`    | `{path, vflags?, timeout?}`  | compile-only; diagnostics as JSON `[{file,line,col,kind,message}]` — `[]` means clean; optional `vflags` mirror the `v_build` command; optional `timeout` (integer seconds, 1..1800, default 600) raises the compile cap |
+| `v_test`      | `{path, only?, files?, stats?, timeout?}` | runs `v test`; optional `only` is a test-function glob forwarded as `VTEST_ONLY_FN` (via `env(1)`); optional `files` is a test-file filter forwarded as `VTEST_ONLY` — comma-separated patterns matched as substrings of each test file's path relative to `path`, pairing with the `v_affected` output; optional `stats` returns structured rows `[{file,name,ok,ms,asserts}]` with the raw output trailing as failure detail; optional `timeout` (integer seconds, 1..1800, default 600) raises the whole-run cap |
 | `v_fmt_check` | `{path}`  | `v fmt -c` — check only, never touches files |
 | `v_fmt`       | `{path}`  | `v fmt -w` — format in place (mutates files) |
 | `v_vet`       | `{path}`  | `v vet` warnings |

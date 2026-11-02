@@ -1,11 +1,12 @@
 // v-mcp-server
 // An MCP (Model Context Protocol) server that exposes V development tooling
-// to coding agents: program compilation and execution, structured build
-// errors, test runs, formatting checks (verify and in-place fix), vet
-// warnings, AST dumps, symbol outlines, one-symbol source slices (v_read),
-// module docs (v_doc), repo briefs, v.mod inspection and a v.mod project
-// lookup (v_where), affected-test selection, who-uses-what queries (definitions, callers,
-// interface implementations) and a server build/info report.
+// to coding agents: program compilation and execution, standalone-snippet
+// runs (v_scratch), structured build errors, test runs, formatting checks
+// (verify and in-place fix), vet warnings, AST dumps, symbol outlines,
+// one-symbol source slices (v_read), module docs (v_doc), repo briefs,
+// v.mod inspection and a v.mod project lookup (v_where), affected-test
+// selection, who-uses-what queries (definitions, callers, interface
+// implementations) and a server build/info report.
 //
 // Built on the official `mcp` module of the V standard library; serves
 // over stdio (newline-delimited JSON-RPC), the transport used by Claude
@@ -39,11 +40,21 @@ const path_args_schema = '{"type":"object","properties":{"path":{"description":"
 // base the tool diffs against HEAD.
 const v_affected_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V project directory","type":"string"},"base":{"description":"Git rev to diff against (default: HEAD)","type":"string"}},"required":["path"],"additionalProperties":false}'
 
-// v_run_schema declares path as required, args as optional argv and stdin as
-// an optional string for the program's stdin; without args the program runs
-// with none, without stdin it has no input. `path` must stay the first
-// property — smoke.vsh counts `"properties":{"path":{` occurrences server-wide.
-const v_run_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V file or project directory","type":"string"},"args":{"description":"Positional arguments passed to the compiled program (optional, JSON array of strings)","type":"array","items":{"type":"string"}},"stdin":{"description":"Text piped to the program as stdin, verbatim and closed with EOF afterwards (optional string; no trailing newline is added. Interactive programs and readers expecting EOF need this.)","type":"string"}},"required":["path"],"additionalProperties":false}'
+// v_run_schema declares path as required, args as optional argv, stdin as
+// an optional string for the program's stdin, timeout as an optional
+// per-call seconds cap and vflags as optional compiler flags; without args
+// the program runs with none, without stdin it has no input. `path` must
+// stay the first property — smoke.vsh counts `"properties":{"path":{`
+// occurrences server-wide.
+const v_run_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V file or project directory","type":"string"},"args":{"description":"Positional arguments passed to the compiled program (optional, JSON array of strings)","type":"array","items":{"type":"string"}},"stdin":{"description":"Text piped to the program as stdin, verbatim and closed with EOF afterwards (optional string; no trailing newline is added. Interactive programs and readers expecting EOF need this.)","type":"string"},"timeout":{"description":"Per-call timeout cap in seconds, 1..1800 (optional integer, default 600): the compile step and the program run are each killed when they exceed it","type":"integer"},"vflags":{"description":"Extra flags passed verbatim to the v CLI (optional, JSON array of strings, e.g. [\\"-prod\\"] or [\\"-cc\\",\\"clang\\"])","type":"array","items":{"type":"string"}}},"required":["path"],"additionalProperties":false}'
+
+// v_scratch_schema backs the projectless v_scratch tool: code is required
+// (the complete standalone program source — a program with fn main or plain
+// top-level statements, which V compiles in script mode) and stdin/vflags
+// are optional. There is no path — smoke.vsh counts this tool's concepts
+// separately, so `code` must stay the first property
+// (`"properties":{"code":{`).
+const v_scratch_schema = '{"type":"object","properties":{"code":{"description":"Complete standalone V source: either a program with fn main, or plain top-level statements (compiled in V script mode). Nothing is wrapped","type":"string"},"stdin":{"description":"Text piped to the program as stdin, verbatim and closed with EOF afterwards (optional string; no trailing newline is added)","type":"string"},"vflags":{"description":"Extra flags passed verbatim to the v CLI (optional, JSON array of strings, e.g. [\\"-g\\"] or [\\"-cc\\",\\"clang\\"])","type":"array","items":{"type":"string"}}},"required":["code"],"additionalProperties":false}'
 
 // v_build_schema declares path as required and vflags as an optional list of
 // CLI flags forwarded verbatim to the v compiler (e.g. -g, -prod, -cc clang).
@@ -51,18 +62,24 @@ const v_run_schema = '{"type":"object","properties":{"path":{"description":"Abso
 // `"properties":{"path":{` occurrences server-wide.
 const v_build_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V file or project directory","type":"string"},"vflags":{"description":"Extra flags passed verbatim to the v CLI (optional, JSON array of strings, e.g. [\\"-prod\\"] or [\\"-cc\\",\\"clang\\"])","type":"array","items":{"type":"string"}}},"required":["path"],"additionalProperties":false}'
 
+// v_errors_schema mirrors v_build_schema and adds the optional per-call
+// `timeout` cap for the compile step; v_build (same payload shape, no
+// override accepted) keeps declaring only path/vflags.
+const v_errors_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V file or project directory","type":"string"},"vflags":{"description":"Extra flags passed verbatim to the v CLI (optional, JSON array of strings, e.g. [\\"-prod\\"] or [\\"-cc\\",\\"clang\\"])","type":"array","items":{"type":"string"}},"timeout":{"description":"Per-call timeout cap in seconds, 1..1800 (optional integer, default 600): the compile step is killed when it exceeds it","type":"integer"}},"required":["path"],"additionalProperties":false}'
+
 // server_info_schema backs the no-argument v_server_info tool. It is the one
-// tool that intentionally declares no properties; smoke.vsh excludes it when
-// enforcing the `path`-property invariant of every other tool.
+// tool that intentionally declares nothing; smoke.vsh excludes it when
+// enforcing the properties invariant of every other tool.
 const server_info_schema = '{"type":"object","properties":{},"additionalProperties":false}'
 
 // v_test_schema declares path as required, only as an optional glob that
 // selects test functions, files as an optional VTEST_ONLY filter that
-// selects test files (both forwarded through env(1)), and stats as an
-// optional boolean switching to structured per-test rows; `path` must stay
+// selects test files (both forwarded through env(1)), stats as an
+// optional boolean switching to structured per-test rows, and timeout as
+// the optional per-call cap for the whole test run; `path` must stay
 // the first property — smoke.vsh counts `"properties":{"path":{`
 // occurrences server-wide.
-const v_test_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V test file or project directory","type":"string"},"only":{"description":"VTEST_ONLY_FN glob: run only test functions whose name matches (optional string, e.g. \\"*handshake*\\")","type":"string"},"files":{"description":"VTEST_ONLY filter: run only the test files whose path (relative to path) contains one of the comma-separated patterns (optional string, e.g. \\"parse_test.v\\"); pairs with the v_affected output","type":"string"},"stats":{"description":"Return structured per-test rows [{file,name,ok,ms,asserts}] instead of raw output (optional boolean); the raw output trails the rows as failure detail when tests fail","type":"boolean"}},"required":["path"],"additionalProperties":false}'
+const v_test_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V test file or project directory","type":"string"},"only":{"description":"VTEST_ONLY_FN glob: run only test functions whose name matches (optional string, e.g. \\"*handshake*\\")","type":"string"},"files":{"description":"VTEST_ONLY filter: run only the test files whose path (relative to path) contains one of the comma-separated patterns (optional string, e.g. \\"parse_test.v\\"); pairs with the v_affected output","type":"string"},"stats":{"description":"Return structured per-test rows [{file,name,ok,ms,asserts}] instead of raw output (optional boolean); the raw output trails the rows as failure detail when tests fail","type":"boolean"},"timeout":{"description":"Per-call timeout cap in seconds, 1..1800 (optional integer, default 600): the whole test run is killed when it exceeds it","type":"integer"}},"required":["path"],"additionalProperties":false}'
 
 // v_uses_schema declares path as required and symbol as an optional string
 // the tool itself validates; same `path`-first rule as every other schema.
@@ -85,27 +102,43 @@ struct PathArgs {
 
 // TestArgs is the payload of v_test: a path, an optional VTEST_ONLY_FN glob
 // (test function names), an optional VTEST_ONLY filter (test file paths),
-// and an optional switch to the structured (-stats) report.
+// an optional switch to the structured (-stats) report, and an optional
+// per-call timeout cap.
 struct TestArgs {
-	path  string
-	only  ?string
-	files ?string
-	stats ?bool
+	path    string
+	only    ?string
+	files   ?string
+	stats   ?bool
+	timeout ?int
 }
 
-// BuildArgs is the payload of v_build: a path plus optional CLI flags
-// forwarded verbatim to the v compiler.
+// BuildArgs is the payload of v_build and v_errors: a path plus optional CLI
+// flags forwarded verbatim to the v compiler, and (v_errors only) an
+// optional per-call timeout cap for the compile step.
 struct BuildArgs {
-	path   string
-	vflags ?[]string
+	path    string
+	vflags  ?[]string
+	timeout ?int
 }
 
 // RunArgs is the payload of v_run: path plus optional positional arguments
 // (argv) forwarded to the compiled program, optional stdin fed to it
-// verbatim, and optional compiler flags for the build step.
+// verbatim, optional compiler flags for the build step, and an optional
+// per-call timeout cap.
 struct RunArgs {
-	path   string
-	args   ?[]string
+	path    string
+	args    ?[]string
+	stdin   ?string
+	vflags  ?[]string
+	timeout ?int
+}
+
+// ScratchArgs is the payload of v_scratch: the complete standalone program
+// source, optional stdin for it, and optional compiler flags. Everything
+// that usually comes through a file path instead rides in the payload —
+// the projectless tool has no path.
+struct ScratchArgs {
+	code   string
 	stdin  ?string
 	vflags ?[]string
 }
@@ -207,6 +240,24 @@ fn validate_vflags(flags []string) ! {
 // interactive prompt) must not silently queue every other call behind it.
 const tool_timeout_seconds = 600
 
+// tool_timeout_seconds_max bounds a call's `timeout` override (v_run, v_test,
+// v_errors): a test suite or a big compile can legitimately need well past
+// the default, but an agent asking for hours of hang time is misusing it —
+// 30 minutes covers any real run.
+const tool_timeout_seconds_max = 1800
+
+// resolve_timeout folds an optional per-call `timeout` override into an
+// absolute seconds value: no argument means the server default
+// (tool_timeout_seconds); an argument must land in 1..tool_timeout_seconds_max
+// or the call is refused before anything spawns.
+fn resolve_timeout(seconds ?int) !int {
+	asked := seconds or { return tool_timeout_seconds }
+	if asked < 1 || asked > tool_timeout_seconds_max {
+		return error('timeout: ${asked} s must be between 1 and ${tool_timeout_seconds_max} (default ${tool_timeout_seconds})')
+	}
+	return asked
+}
+
 // Capture is everything run_capture learned about one child process: the
 // two output streams, unmerged (callers decide how to display them), the
 // exit code, and whether the tool timeout fired.
@@ -219,11 +270,14 @@ struct Capture {
 
 // run_capture spawns args[0] with args[1..] and polls it to completion:
 // no timed wait exists in v 0.5.2 (os.Process), so the child is checked
-// every 500 ms until tool_timeout_seconds (SIGTERM first, then SIGKILL
-// after 3 s). Shared by every spawning caller — run_v_tool, the compile
-// step behind the cache, v_run's program phase, v_server_info and the
-// toolchain stamp — each formats the Capture its own way.
-fn run_capture(args []string) Capture {
+// every 500 ms until the seconds cap (SIGTERM first, then SIGKILL
+// after 3 s) — the server default via tool_timeout_seconds, or a call's
+// timeout= override handed down through the tool fns. Shared by every
+// spawning caller — run_v_tool, the compile step behind the cache, the
+// built-program runners (v_run, v_scratch), v_test's stats branch,
+// v_affected's git probe, v_server_info and the toolchain stamp — each
+// formats the Capture its own way.
+fn run_capture(args []string, seconds int) Capture {
 	mut p := os.new_process(args[0])
 	p.set_args(args[1..])
 	p.set_redirect_stdio()
@@ -234,7 +288,7 @@ fn run_capture(args []string) Capture {
 	start := time.now().unix()
 	mut timed_out := false
 	for p.is_alive() {
-		if time.now().unix() - start > i64(tool_timeout_seconds) {
+		if time.now().unix() - start > i64(seconds) {
 			if !timed_out {
 				timed_out = true
 				p.signal_term()
@@ -265,15 +319,17 @@ fn merge_streams(stdout string, stderr string) string {
 	return out.trim_space()
 }
 
-// run_v_tool executes a `v` subcommand and wraps its output in an MCP tool
-// result. A non-zero exit code yields an error result carrying both streams.
-fn run_v_tool(args []string) mcp.ToolResult {
-	c := run_capture(args)
+// run_v_tool executes a `v` subcommand (seconds = this call's cap, the
+// server default via tool_timeout_seconds) and wraps its output in an MCP
+// tool result. A non-zero exit code yields an error result carrying both
+// streams.
+fn run_v_tool(args []string, seconds int) mcp.ToolResult {
+	c := run_capture(args, seconds)
 	mut out := merge_streams(c.stdout, c.stderr)
 	if c.exit_code != 0 || c.timed_out {
 		if out.len == 0 {
 			if c.timed_out {
-				out = 'command timed out after ${tool_timeout_seconds} s'
+				out = 'command timed out after ${seconds} s'
 			} else {
 				out = 'command failed with exit code ${c.exit_code}'
 			}
@@ -378,7 +434,7 @@ fn cache_dir() string {
 // fold this stamp in, so upgrading the toolchain invalidates stale entries;
 // one cheap spawn per server start.
 fn refresh_toolchain_stamp() {
-	c := run_capture(['v', '-version'])
+	c := run_capture(['v', '-version'], tool_timeout_seconds)
 	if c.timed_out || c.exit_code != 0 {
 		return
 	}
@@ -513,8 +569,10 @@ fn prune_cache() {
 // build_with_cache is the compile step with the warm cache in front: on a
 // key hit the stored record (and binary, when stored) is replayed and no v
 // process runs; on a miss it compiles to a temp output and stores the
-// record. An empty key (out-of-scope target) skips both cache and save.
-fn build_with_cache(path string, flags []string) BuildOutcome {
+// record. `seconds` is the per-call cap for the compile spawn (the server
+// default is tool_timeout_seconds). An empty key (out-of-scope target)
+// skips both cache and save.
+fn build_with_cache(path string, flags []string, seconds int) BuildOutcome {
 	key := build_cache_key(path, flags)
 	if key != '' {
 		if rec := cache_load(key) {
@@ -528,20 +586,21 @@ fn build_with_cache(path string, flags []string) BuildOutcome {
 			}
 		}
 	}
-	return compile_and_store(path, flags, key)
+	return compile_and_store(path, flags, key, seconds)
 }
 
-// compile_and_store is the miss path: run v against a temp output, fold the
-// capture into a record (text capped, with a summary for stream-empty
-// failures), store it under key when there is one, and return the facts —
-// with the freshly built binary to execute when the compile succeeded.
-fn compile_and_store(path string, flags []string, key string) BuildOutcome {
+// compile_and_store is the miss path: run v against a temp output (seconds
+// = the call's cap), fold the capture into a record (text capped, with a
+// summary for stream-empty failures), store it under key when there is one,
+// and return the facts — with the freshly built binary to execute when the
+// compile succeeded.
+fn compile_and_store(path string, flags []string, key string, seconds int) BuildOutcome {
 	tmp := tmp_output_path('cache_target')
-	compile := run_capture(compile_args(tmp, path, flags))
+	compile := run_capture(compile_args(tmp, path, flags), seconds)
 	ok := compile.exit_code == 0 && !compile.timed_out
 	text := merge_streams(compile.stdout, compile.stderr)
 	summary := if compile.timed_out {
-		'command timed out after ${tool_timeout_seconds} s'
+		'command timed out after ${seconds} s'
 	} else if compile.exit_code != 0 {
 		'command failed with exit code ${compile.exit_code}'
 	} else {
@@ -590,7 +649,7 @@ fn v_build_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	// The run_v_tool text contract, rebuilt from the record: failures carry
 	// what the compiler printed (or the summary when it printed nothing);
 	// successes report 'ok'.
-	outcome := build_with_cache(a.path, flags)
+	outcome := build_with_cache(a.path, flags, tool_timeout_seconds)
 	if !outcome.ok {
 		return to_error_result(if outcome.text.len == 0 { outcome.summary } else { outcome.text })
 	}
@@ -620,48 +679,30 @@ fn program_stdin_cmd(bin string, args []string, stdin_path string) []string {
 	return cmd
 }
 
-fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
-	a := decode_args[RunArgs](arguments) or {
-		return to_error_result('bad arguments: ${err.msg()}')
-	}
-	validate_path(a.path) or {
-		return to_error_result('bad arguments: ${err.msg()}')
-	}
-
-	// Same failure contract as run_v_tool: an error result carrying whatever
-	// the compiler printed (or a fallback line when it printed nothing). The
-	// warm cache may hold a build for these exact sources — then the stored
-	// binary runs immediately and no compiler output section appears.
-	flags := a.vflags or { []string{} }
-	validate_vflags(flags) or {
-		return to_error_result('bad arguments: ${err.msg()}')
-	}
-	outcome := build_with_cache(a.path, flags)
-	if !outcome.ok {
-		build_log := if outcome.text.len == 0 { outcome.summary } else { outcome.text }
-		return to_error_result('v_run build failed:\n${build_log}')
-	}
-
-	args := a.args or { []string{} }
-	stdin := a.stdin or { '' }
-
-	// With stdin the program runs through a one-off temp file (see
-	// program_stdin_cmd); without it, straight from the printed binary.
-	// Same exit-code and stream contract either way.
-	mut prog := Capture{}
+// run_built_program executes a freshly built (or cache-replayed) binary for
+// v_run and v_scratch. With stdin the program runs through a one-off temp
+// file (see program_stdin_cmd); without it, straight from the binary with
+// argv. Same exit-code and stream contract either way.
+fn run_built_program(bin string, args []string, stdin string, seconds int) !Capture {
 	if stdin != '' {
 		stdin_path := tmp_output_path('stdin')
 		os.write_file(stdin_path, stdin)!
 		defer {
 			os.rm(stdin_path) or {}
 		}
-		prog = run_capture(program_stdin_cmd(outcome.bin_path, args, stdin_path))
-	} else {
-		mut pargs := []string{cap: args.len + 1}
-		pargs << outcome.bin_path
-		pargs << args
-		prog = run_capture(pargs)
+		return run_capture(program_stdin_cmd(bin, args, stdin_path), seconds)
 	}
+	mut pargs := []string{cap: args.len + 1}
+	pargs << bin
+	pargs << args
+	return run_capture(pargs, seconds)
+}
+
+// present_program_run formats one compiled program run as a tool result —
+// the output shape shared by v_run and v_scratch: labeled streams, the
+// compiler's own chatter ahead when the build printed any (a quiet, clean
+// build prints none), and the timeout / exit-code verdict last.
+fn present_program_run(outcome BuildOutcome, prog Capture, seconds int) mcp.ToolResult {
 	mut parts := []string{}
 	if outcome.text.len > 0 {
 		parts << 'compiler output:\n${outcome.text}'
@@ -673,7 +714,7 @@ fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 		parts << 'program stderr:\n${prog.stderr.trim_space()}'
 	}
 	if prog.timed_out {
-		parts << 'program timed out after ${tool_timeout_seconds} s'
+		parts << 'program timed out after ${seconds} s'
 		return to_error_result(truncate(parts.join('\n')))
 	}
 	if prog.exit_code != 0 {
@@ -684,6 +725,82 @@ fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 		parts << 'ok (exit 0, no output)'
 	}
 	return mcp.tool_text_result(truncate(parts.join('\n')))
+}
+
+fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[RunArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	validate_path(a.path) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+
+	// Same failure contract as run_v_tool: an error result carrying whatever
+	// the compiler printed (or a fallback line when it printed nothing). The
+	// warm cache may hold a build for these exact sources — then no compile
+	// step runs: the stored binary (and the stored compiler text) replay.
+	flags := a.vflags or { []string{} }
+	validate_vflags(flags) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	seconds := resolve_timeout(a.timeout) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	outcome := build_with_cache(a.path, flags, seconds)
+	if !outcome.ok {
+		build_log := if outcome.text.len == 0 { outcome.summary } else { outcome.text }
+		return to_error_result('v_run build failed:\n${build_log}')
+	}
+
+	args := a.args or { []string{} }
+	prog := run_built_program(outcome.bin_path, args, a.stdin or { '' }, seconds)!
+	return present_program_run(outcome, prog, seconds)
+}
+
+// ---- v_scratch: projectless snippets ----------------------------------------
+
+// scratch_dir roots the snippet files under the system temp tree, one dir
+// per server process: the server never writes inside an agent's project for
+// a throwaway compile.
+fn scratch_dir() string {
+	return os.join_path(os.temp_dir(), 'v-mcp-scratch-${os.getpid()}')
+}
+
+// scratch_source_path content-addresses a snippet to a .v file: identical
+// snippets reuse one file (and one warm-cache record), distinct snippets
+// never touch the same name.
+fn scratch_source_path(code string) string {
+	hash := sha256.sum(code.bytes()).hex()[..8]
+	return os.join_path(scratch_dir(), 's_${hash}.v')
+}
+
+fn v_scratch_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
+	a := decode_args[ScratchArgs](arguments) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	flags := a.vflags or { []string{} }
+	validate_vflags(flags) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+
+	// The source lands on disk content-addressed (see scratch_source_path),
+	// where build_cache_key reads it. Nothing is deleted after the call:
+	// a later identical snippet re-derives the same key and replays the
+	// cache entry — the files are tiny and the dir is per-process.
+	src := scratch_source_path(a.code)
+	os.mkdir_all(scratch_dir())!
+	os.write_file(src, a.code)!
+
+	// Same failure contract as v_run: an error result carrying whatever the
+	// compiler printed (or a fallback line when it printed nothing).
+	outcome := build_with_cache(src, flags, tool_timeout_seconds)
+	if !outcome.ok {
+		build_log := if outcome.text.len == 0 { outcome.summary } else { outcome.text }
+		return to_error_result('v_scratch build failed:\n${build_log}')
+	}
+
+	prog := run_built_program(outcome.bin_path, [], a.stdin or { '' }, tool_timeout_seconds)!
+	return present_program_run(outcome, prog, tool_timeout_seconds)
 }
 
 // ---- v_errors: compile-only, structured diagnostics -------------------------
@@ -699,7 +816,10 @@ fn v_errors_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	validate_vflags(flags) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
-	outcome := build_with_cache(a.path, flags)
+	seconds := resolve_timeout(a.timeout) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	outcome := build_with_cache(a.path, flags, seconds)
 	diags := parse_diagnostics(outcome.text)
 	if diags.len == 0 && !outcome.ok {
 		// failed without parseable diagnostics — surface it once instead of
@@ -882,6 +1002,9 @@ fn v_test_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	validate_filter(files) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
+	seconds := resolve_timeout(a.timeout) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
 	filters := env_test_filter_prefix(only, files)
 	stats := a.stats or { false }
 	if !stats {
@@ -892,7 +1015,7 @@ fn v_test_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 		cmd << '-no-parallel'
 		cmd << 'test'
 		cmd << a.path
-		return run_v_tool(cmd)
+		return run_v_tool(cmd, seconds)
 	}
 	// structured mode: `-stats` output parses into one row per test result;
 	// same filter hygiene as the plain branch above
@@ -904,7 +1027,7 @@ fn v_test_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	cmd << '-no-parallel'
 	cmd << 'test'
 	cmd << a.path
-	c := run_capture(cmd)
+	c := run_capture(cmd, seconds)
 	text := merge_streams(c.stdout, c.stderr)
 	rows := parse_test_rows(text)
 	if rows.len == 0 {
@@ -913,7 +1036,7 @@ fn v_test_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 		// timeout note when the run hit the process cap)
 		if c.exit_code != 0 || c.timed_out {
 			fallback := if c.timed_out {
-				'test run timed out after ${tool_timeout_seconds} s'
+				'test run timed out after ${seconds} s'
 			} else {
 				text
 			}
@@ -932,7 +1055,7 @@ fn v_fmt_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
 	// `v fmt -c` checks formatting without touching files (exit 1 if unformatted).
-	return run_v_tool(['v', 'fmt', '-c', a.path])
+	return run_v_tool(['v', 'fmt', '-c', a.path], tool_timeout_seconds)
 }
 
 // v_fmt_fix_tool closes the formatting loop: it runs `v fmt -w`, which
@@ -944,7 +1067,7 @@ fn v_fmt_fix_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	validate_path(a.path) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
-	return run_v_tool(['v', 'fmt', '-w', a.path])
+	return run_v_tool(['v', 'fmt', '-w', a.path], tool_timeout_seconds)
 }
 
 fn v_vet_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
@@ -954,7 +1077,7 @@ fn v_vet_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	validate_path(a.path) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
-	return run_v_tool(['v', 'vet', a.path])
+	return run_v_tool(['v', 'vet', a.path], tool_timeout_seconds)
 }
 
 fn v_ast_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
@@ -965,7 +1088,7 @@ fn v_ast_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
 	// `-p` prints the AST JSON to stdout instead of writing a sidecar file.
-	return run_v_tool(['v', 'ast', '-p', a.path])
+	return run_v_tool(['v', 'ast', '-p', a.path], tool_timeout_seconds)
 }
 
 // ---- v_symbols: a pure-V symbol outline (no subprocess) ---------------------
@@ -1149,7 +1272,7 @@ fn v_doc_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	validate_path(a.path) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
-	return run_v_tool(['v', 'doc', a.path])
+	return run_v_tool(['v', 'doc', a.path], tool_timeout_seconds)
 }
 
 // ---- v_deps: read a project's v.mod -----------------------------------------
@@ -1288,7 +1411,7 @@ fn v_affected_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	// Changed paths come from git, relative to a.path; the library receives
 	// them as plain data (same contract its CLI uses). Spawned like every
 	// other child (run_capture): streams split, timeout cap applied.
-	git := run_capture(['git', '-C', a.path, 'diff', '--name-only', base])
+	git := run_capture(['git', '-C', a.path, 'diff', '--name-only', base], tool_timeout_seconds)
 	if git.exit_code != 0 || git.timed_out {
 		reason := if git.timed_out {
 			'git timed out after ${tool_timeout_seconds} s'
@@ -1338,7 +1461,7 @@ fn v_uses_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 // version of the v toolchain behind it — enough to spot a stale re-spawn in
 // one call.
 fn v_server_info_tool(_ctx mcp.Context, _arguments string) !mcp.ToolResult {
-	ver := run_capture(['v', '-version'])
+	ver := run_capture(['v', '-version'], tool_timeout_seconds)
 	// @BUILD_TIMESTAMP bakes in as an epoch string; render it human-readable.
 	build_time := time.unix(@BUILD_TIMESTAMP.i64()).str()
 	mut out := '${server_name} ${server_version}\nbuilt at: ${build_time}'
@@ -1354,7 +1477,7 @@ fn new_vlang_server() !mcp.Server {
 	mut server := mcp.new_server(
 		name:         server_name
 		version:      server_version
-		instructions: "V development server: compile, test (with a test-function glob only=… or a test-file filter files=…), format-check and format in place, vet, dump AST JSON, outline symbols, read one symbol's source (v_read), document a module, inspect v.mod, look up v.mod projects under a directory (v_where), brief a repo, run only affected tests, run a compiled program, list compiler diagnostics as JSON, answer who-uses-what, and report its own build (v_server_info). PASS ABSOLUTE PATHS."
+		instructions: "V development server: compile, test (with a test-function glob only=… or a test-file filter files=…), format-check and format in place, vet, dump AST JSON, outline symbols, read one symbol's source (v_read), document a module, inspect v.mod, look up v.mod projects under a directory (v_where), brief a repo, run only affected tests, run a compiled program, run a standalone snippet with no project scaffolding (v_scratch), list compiler diagnostics as JSON, answer who-uses-what, and report its own build (v_server_info). PASS ABSOLUTE PATHS."
 	)
 	server.add_tool(mcp.Tool{
 		name:         'v_build'
@@ -1363,17 +1486,22 @@ fn new_vlang_server() !mcp.Server {
 	}, v_build_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_run'
-		description:  'Compile path, then execute it. Optional args (JSON array of strings) are passed to the program; optional stdin (string) is piped to the program verbatim (no trailing newline added) and closed with EOF; optional vflags (JSON array of strings) are forwarded to the compiler for the build. Returns the program output; compile failures return the compiler diagnostics as an error. Timeout and output caps apply.'
+		description:  'Compile path, then execute it. Optional args (JSON array of strings) are passed to the program; optional stdin (string) is piped to the program verbatim (no trailing newline added) and closed with EOF; optional timeout (integer seconds, 1..1800, default 600) raises the per-step cap; optional vflags (JSON array of strings) are forwarded to the compiler for the build. Returns the program output; compile failures return the compiler diagnostics as an error. Output caps apply.'
 		input_schema: v_run_schema
 	}, v_run_tool)!
 	server.add_tool(mcp.Tool{
+		name:         'v_scratch'
+		description:  'Compile and run a standalone V snippet (code) with zero project scaffolding: pass the complete source — a program with fn main, or plain top-level statements (V compiles those in script mode); nothing is wrapped. Optional stdin (string) is piped verbatim (no trailing newline, EOF afterwards); optional vflags (JSON array of strings) go to the compiler. Identical snippets replay the warm build cache. Output labeled and failure contract identical to v_run.'
+		input_schema: v_scratch_schema
+	}, v_scratch_tool)!
+	server.add_tool(mcp.Tool{
 		name:         'v_errors'
-		description:  'Compile only; return compiler diagnostics as JSON [{file,line,col,kind,message}] with kind error/warning/note. An empty array means the build is clean. Optional vflags (JSON array of strings) are forwarded to the compiler, mirroring the v_build command.'
-		input_schema: v_build_schema
+		description:  'Compile only; return compiler diagnostics as JSON [{file,line,col,kind,message}] with kind error/warning/note. An empty array means the build is clean. Optional vflags (JSON array of strings) are forwarded to the compiler, mirroring the v_build command; optional timeout (integer seconds, 1..1800, default 600) raises the compile cap.'
+		input_schema: v_errors_schema
 	}, v_errors_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_test'
-		description:  'Run `v test` on a file or project (path). Optional only (string) is a VTEST_ONLY_FN glob forwarded via env(1) — run only test functions whose name matches, e.g. "*handshake*". Optional files (string) is a VTEST_ONLY file filter forwarded via env(1) — run only test files whose relative path contains one of the comma-separated patterns, e.g. "parse_test.v"; pairs with the v_affected output. Optional stats (boolean) returns structured rows [{file,name,ok,ms,asserts}] with the raw output as failure detail; unparsable runs fall back to the raw view.'
+		description:  'Run `v test` on a file or project (path). Optional only (string) is a VTEST_ONLY_FN glob forwarded via env(1) — run only test functions whose name matches, e.g. "*handshake*". Optional files (string) is a VTEST_ONLY file filter forwarded via env(1) — run only test files whose relative path contains one of the comma-separated patterns, e.g. "parse_test.v"; pairs with the v_affected output. Optional stats (boolean) returns structured rows [{file,name,ok,ms,asserts}] with the raw output as failure detail; unparsable runs fall back to the raw view. Optional timeout (integer seconds, 1..1800, default 600) raises the whole-run cap.'
 		input_schema: v_test_schema
 	}, v_test_tool)!
 	server.add_tool(mcp.Tool{
