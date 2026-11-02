@@ -39,10 +39,11 @@ const path_args_schema = '{"type":"object","properties":{"path":{"description":"
 // base the tool diffs against HEAD.
 const v_affected_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V project directory","type":"string"},"base":{"description":"Git rev to diff against (default: HEAD)","type":"string"}},"required":["path"],"additionalProperties":false}'
 
-// v_run_schema declares path as required and args as optional argv; without
-// args the program runs with none. `path` must stay the first property —
-// smoke.vsh counts `"properties":{"path":{` occurrences server-wide.
-const v_run_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V file or project directory","type":"string"},"args":{"description":"Positional arguments passed to the compiled program (optional, JSON array of strings)","type":"array","items":{"type":"string"}}},"required":["path"],"additionalProperties":false}'
+// v_run_schema declares path as required, args as optional argv and stdin as
+// an optional string for the program's stdin; without args the program runs
+// with none, without stdin it has no input. `path` must stay the first
+// property — smoke.vsh counts `"properties":{"path":{` occurrences server-wide.
+const v_run_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V file or project directory","type":"string"},"args":{"description":"Positional arguments passed to the compiled program (optional, JSON array of strings)","type":"array","items":{"type":"string"}},"stdin":{"description":"Text piped to the program as stdin, verbatim and closed with EOF afterwards (optional string; no trailing newline is added. Interactive programs and readers expecting EOF need this.)","type":"string"}},"required":["path"],"additionalProperties":false}'
 
 // v_build_schema declares path as required and vflags as an optional list of
 // CLI flags forwarded verbatim to the v compiler (e.g. -g, -prod, -cc clang).
@@ -56,11 +57,12 @@ const v_build_schema = '{"type":"object","properties":{"path":{"description":"Ab
 const server_info_schema = '{"type":"object","properties":{},"additionalProperties":false}'
 
 // v_test_schema declares path as required, only as an optional glob that
-// selects which test functions run (forwarded via the VTEST_ONLY_FN
-// environment variable through env(1)), and stats as an optional boolean
-// switching to structured per-test rows; `path` must stay the first property
-// — smoke.vsh counts `"properties":{"path":{` occurrences server-wide.
-const v_test_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V test file or project directory","type":"string"},"only":{"description":"VTEST_ONLY_FN glob: run only test functions whose name matches (optional string, e.g. \\"*handshake*\\")","type":"string"},"stats":{"description":"Return structured per-test rows [{file,name,ok,ms,asserts}] instead of raw output (optional boolean); the raw output trails the rows as failure detail when tests fail","type":"boolean"}},"required":["path"],"additionalProperties":false}'
+// selects test functions, files as an optional VTEST_ONLY filter that
+// selects test files (both forwarded through env(1)), and stats as an
+// optional boolean switching to structured per-test rows; `path` must stay
+// the first property — smoke.vsh counts `"properties":{"path":{`
+// occurrences server-wide.
+const v_test_schema = '{"type":"object","properties":{"path":{"description":"Absolute path of a V test file or project directory","type":"string"},"only":{"description":"VTEST_ONLY_FN glob: run only test functions whose name matches (optional string, e.g. \\"*handshake*\\")","type":"string"},"files":{"description":"VTEST_ONLY filter: run only the test files whose path (relative to path) contains one of the comma-separated patterns (optional string, e.g. \\"parse_test.v\\"); pairs with the v_affected output","type":"string"},"stats":{"description":"Return structured per-test rows [{file,name,ok,ms,asserts}] instead of raw output (optional boolean); the raw output trails the rows as failure detail when tests fail","type":"boolean"}},"required":["path"],"additionalProperties":false}'
 
 // v_uses_schema declares path as required and symbol as an optional string
 // the tool itself validates; same `path`-first rule as every other schema.
@@ -81,11 +83,13 @@ struct PathArgs {
 	path string
 }
 
-// TestArgs is the payload of v_test: a path, an optional VTEST_ONLY glob and
-// an optional switch to the structured (-stats) report.
+// TestArgs is the payload of v_test: a path, an optional VTEST_ONLY_FN glob
+// (test function names), an optional VTEST_ONLY filter (test file paths),
+// and an optional switch to the structured (-stats) report.
 struct TestArgs {
 	path  string
 	only  ?string
+	files ?string
 	stats ?bool
 }
 
@@ -97,11 +101,12 @@ struct BuildArgs {
 }
 
 // RunArgs is the payload of v_run: path plus optional positional arguments
-// (argv) forwarded to the compiled program, and optional compiler flags for
-// the build step.
+// (argv) forwarded to the compiled program, optional stdin fed to it
+// verbatim, and optional compiler flags for the build step.
 struct RunArgs {
 	path   string
 	args   ?[]string
+	stdin  ?string
 	vflags ?[]string
 }
 
@@ -156,19 +161,21 @@ fn validate_path(path string) ! {
 	}
 }
 
-// only_allowed_chars lists the characters a VTEST_ONLY_FN glob may contain:
-// word characters (test fn names) plus the glob metacharacters * ? [] and -
-// (a valid trailing range character). Spaces and quotes stay out by design —
-// the string travels verbatim through env(1) as VAR=value text.
-const only_allowed_chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.*?[]-'
+// filter_allowed_chars lists the characters a VTEST_ONLY (test files) or
+// VTEST_ONLY_FN (test functions) filter may contain: word characters plus
+// the command's separators — glob metacharacters * ? [] and - for fn names,
+// / for file paths and , to list several patterns. Spaces and quotes stay
+// out by design — the string travels verbatim through env(1) as VAR=value
+// text.
+const filter_allowed_chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.*?[]-/,'
 
-// validate_only rejects a test-function glob that carries characters no test
-// name or glob needs, before it ever reaches env(1).
-fn validate_only(glob string) ! {
-	allowed := only_allowed_chars.bytes()
-	for b in glob.bytes() {
+// validate_filter rejects a test-function glob or a test-file filter that
+// carries characters no filter needs, before it ever reaches env(1).
+fn validate_filter(pattern string) ! {
+	allowed := filter_allowed_chars.bytes()
+	for b in pattern.bytes() {
 		if b !in allowed {
-			return error('only: unsupported character "${b.ascii_str()}"; test names are word characters and globs may use * ? [ ] -')
+			return error('unsupported character "${b.ascii_str()}": fn globs (only) and file filters (files) allow word characters plus * ? [ ] -, and file filters may also use / and ,')
 		}
 	}
 }
@@ -213,13 +220,17 @@ struct Capture {
 // run_capture spawns args[0] with args[1..] and polls it to completion:
 // no timed wait exists in v 0.5.2 (os.Process), so the child is checked
 // every 500 ms until tool_timeout_seconds (SIGTERM first, then SIGKILL
-// after 3 s). Shared by run_v_tool, v_run and v_errors; each caller
-// formats the Capture its own way.
+// after 3 s). Shared by every spawning caller — run_v_tool, the compile
+// step behind the cache, v_run's program phase, v_server_info and the
+// toolchain stamp — each formats the Capture its own way.
 fn run_capture(args []string) Capture {
 	mut p := os.new_process(args[0])
 	p.set_args(args[1..])
 	p.set_redirect_stdio()
 	p.run()
+	defer {
+		p.close()
+	}
 	start := time.now().unix()
 	mut timed_out := false
 	for p.is_alive() {
@@ -236,9 +247,6 @@ fn run_capture(args []string) Capture {
 		time.sleep(500 * time.millisecond)
 	}
 	p.wait() // reaps the (exited) child and sets p.code
-	defer {
-		p.close()
-	}
 	return Capture{
 		stdout:    p.stdout_slurp()
 		stderr:    p.stderr_slurp()
@@ -251,7 +259,8 @@ fn run_capture(args []string) Capture {
 fn merge_streams(stdout string, stderr string) string {
 	mut out := stdout
 	if stderr != '' {
-		out += if out != '' { '\n' } else { '' } + stderr
+		// a separation newline only when stdout is non-empty
+		out += (if out != '' { '\n' } else { '' }) + stderr
 	}
 	return out.trim_space()
 }
@@ -308,7 +317,8 @@ fn tmp_output_path(tag string) string {
 // compile_args assembles the v compile invocation shared by v_build, v_run
 // and v_errors: optional vflags first, then the temp output and the target.
 fn compile_args(bin string, path string, flags []string) []string {
-	mut cargs := []string{cap: 4 + flags.len}
+	// 'v' + flags + '-o' + bin + '-no-parallel' + path
+	mut cargs := []string{cap: 5 + flags.len}
 	cargs << 'v'
 	cargs << flags
 	cargs << '-o'
@@ -590,6 +600,26 @@ fn v_build_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 
 // ---- v_run: compile once, then execute the binary ---------------------------
 
+// program_stdin_cmd builds the sh(1) invocation that runs bin with stdin
+// redirected from a one-off file. Inside the script $1 is the file (f="$1"
+// remembers it), shift promotes bin to $1, and exec replaces the shell with
+// `bin args... < file`: every variable byte — binary path, arguments, input
+// file — travels as argv, re-quoted only by "$@", so nothing user-supplied
+// is parsed by the shell; exec folds the shell away, keeping the timeout
+// machinery on the program's pid.
+fn program_stdin_cmd(bin string, args []string, stdin_path string) []string {
+	mut cmd := []string{cap: 6 + args.len}
+	cmd << 'sh'
+	cmd << '-c'
+	// $1 = stdin_path, $2 = bin, $3.. = args: save the file, drop it, run what is left
+	cmd << 'f="$1"; shift; exec "$1" "$@" <"$f"'
+	cmd << 'v_run' // sh's invocation name ($0) — never inspected
+	cmd << stdin_path
+	cmd << bin
+	cmd << args
+	return cmd
+}
+
 fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	a := decode_args[RunArgs](arguments) or {
 		return to_error_result('bad arguments: ${err.msg()}')
@@ -613,11 +643,25 @@ fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	}
 
 	args := a.args or { []string{} }
-	mut pargs := []string{cap: args.len + 1}
-	pargs << outcome.bin_path
-	pargs << args
+	stdin := a.stdin or { '' }
 
-	prog := run_capture(pargs)
+	// With stdin the program runs through a one-off temp file (see
+	// program_stdin_cmd); without it, straight from the printed binary.
+	// Same exit-code and stream contract either way.
+	mut prog := Capture{}
+	if stdin != '' {
+		stdin_path := tmp_output_path('stdin')
+		os.write_file(stdin_path, stdin)!
+		defer {
+			os.rm(stdin_path) or {}
+		}
+		prog = run_capture(program_stdin_cmd(outcome.bin_path, args, stdin_path))
+	} else {
+		mut pargs := []string{cap: args.len + 1}
+		pargs << outcome.bin_path
+		pargs << args
+		prog = run_capture(pargs)
+	}
 	mut parts := []string{}
 	if outcome.text.len > 0 {
 		parts << 'compiler output:\n${outcome.text}'
@@ -658,10 +702,10 @@ fn v_errors_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	outcome := build_with_cache(a.path, flags)
 	diags := parse_diagnostics(outcome.text)
 	if diags.len == 0 && !outcome.ok {
-		// Failed without parseable output; surface it raw instead of letting
-		// `[]` pass as "clean build".
-		fallback := if outcome.summary.len > 0 { outcome.summary } else { outcome.text }
-		return to_error_result('v_errors: ${fallback}:\n${truncate(outcome.text)}')
+		// failed without parseable diagnostics — surface it once instead of
+		// letting `[]` pass as a clean build: the summary (always set for a
+		// failed compile) explains, the captured text follows
+		return to_error_result('v_errors: ${outcome.summary}:\n${truncate(outcome.text)}')
 	}
 	body := json2.encode(diags)
 	return mcp.tool_text_result(truncate(body))
@@ -789,6 +833,37 @@ fn test_report(rows []TestRow, raw string) string {
 	return out
 }
 
+// env_test_filter_prefix assembles the env(1) filter section shared by the
+// plain and structured v_test branches: each filter is either set verbatim
+// (when the caller asked for it) or explicitly unset — this server often
+// runs itself under a narrowed `v test` harness, and inherited filters would
+// silently exclude every test of the call. The filters travel through env(1)
+// because set_environment would *replace* the child environment outright
+// (PATH, HOME and friends would vanish), while env(1) appends to the
+// inherited environment. VTEST_ONLY filters test file paths, VTEST_ONLY_FN
+// test function names, and every -u comes before any assignment: env(1)
+// stops parsing options at the first VAR=val, later flags are the command.
+fn env_test_filter_prefix(only string, files string) []string {
+	mut env := []string{}
+	// the clears (wanted or not, they must precede every assignment)
+	if only == '' {
+		env << '-u'
+		env << 'VTEST_ONLY_FN'
+	}
+	if files == '' {
+		env << '-u'
+		env << 'VTEST_ONLY'
+	}
+	// the assignments
+	if only != '' {
+		env << 'VTEST_ONLY_FN=${only}'
+	}
+	if files != '' {
+		env << 'VTEST_ONLY=${files}'
+	}
+	return env
+}
+
 fn v_test_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	a := decode_args[TestArgs](arguments) or {
 		return to_error_result('bad arguments: ${err.msg()}')
@@ -797,37 +872,33 @@ fn v_test_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
 	only := a.only or { '' }.trim_space()
-	if only.len > 0 {
-		// VTEST_ONLY_FN selects test functions through the environment, but
-		// os.Process.set_environment *replaces* the child environment outright
-		// (PATH, HOME and friends would vanish) — so forward through env(1),
-		// which appends to the inherited environment instead. (VTEST_ONLY
-		// filters file paths; VTEST_ONLY_FN filters test function names.)
-		validate_only(only) or {
-			return to_error_result('bad arguments: ${err.msg()}')
-		}
+	files := a.files or { '' }.trim_space()
+	// both filters travel verbatim through env(1); reject anything no
+	// pattern needs before it ever reaches a process (an empty pattern
+	// validates trivially)
+	validate_filter(only) or {
+		return to_error_result('bad arguments: ${err.msg()}')
 	}
+	validate_filter(files) or {
+		return to_error_result('bad arguments: ${err.msg()}')
+	}
+	filters := env_test_filter_prefix(only, files)
 	stats := a.stats or { false }
 	if !stats {
-		if only.len == 0 {
-			// this server may itself be running under a `v test` harness
-			// whose VTEST_ONLY_FN is narrowed to suite-internal globs; left
-			// inherited, it silently excludes every test, so env(1) -u
-			// clears it for plain runs
-			return run_v_tool(['env', '-u', 'VTEST_ONLY_FN', 'v', '-no-parallel', 'test', a.path])
-		}
-		return run_v_tool(['env', 'VTEST_ONLY_FN=${only}', 'v', '-no-parallel', 'test', a.path])
+		mut cmd := []string{cap: 6 + filters.len}
+		cmd << 'env'
+		cmd << filters
+		cmd << 'v'
+		cmd << '-no-parallel'
+		cmd << 'test'
+		cmd << a.path
+		return run_v_tool(cmd)
 	}
 	// structured mode: `-stats` output parses into one row per test result;
-	// same VTEST_ONLY_FN hygiene as the plain branch above
-	mut cmd := []string{cap: 8}
+	// same filter hygiene as the plain branch above
+	mut cmd := []string{}
 	cmd << 'env'
-	if only.len > 0 {
-		cmd << 'VTEST_ONLY_FN=${only}'
-	} else {
-		cmd << '-u'
-		cmd << 'VTEST_ONLY_FN'
-	}
+	cmd << filters
 	cmd << 'v'
 	cmd << '-stats'
 	cmd << '-no-parallel'
@@ -1215,13 +1286,19 @@ fn v_affected_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	base := if b.len > 0 { b } else { 'HEAD' }
 
 	// Changed paths come from git, relative to a.path; the library receives
-	// them as plain data (same contract its CLI uses).
-	git := os.exec(['git', '-C', a.path, 'diff', '--name-only', base])
-	if git.exit_code != 0 {
-		return to_error_result('v_affected: git diff failed: ${git.output.trim_space()}')
+	// them as plain data (same contract its CLI uses). Spawned like every
+	// other child (run_capture): streams split, timeout cap applied.
+	git := run_capture(['git', '-C', a.path, 'diff', '--name-only', base])
+	if git.exit_code != 0 || git.timed_out {
+		reason := if git.timed_out {
+			'git timed out after ${tool_timeout_seconds} s'
+		} else {
+			merge_streams(git.stdout, git.stderr)
+		}
+		return to_error_result('v_affected: git diff failed: ${reason.trim_space()}')
 	}
 	mut changed := []string{}
-	for row in git.output.split('\n') {
+	for row in git.stdout.split('\n') {
 		mut p := row.trim_space()
 		if p.starts_with('"') {
 			p = p.trim_left('"').trim_right('"')
@@ -1277,7 +1354,7 @@ fn new_vlang_server() !mcp.Server {
 	mut server := mcp.new_server(
 		name:         server_name
 		version:      server_version
-		instructions: "V development server: compile, test (with a test-function glob only=…), format-check and format in place, vet, dump AST JSON, outline symbols, read one symbol's source (v_read), document a module, inspect v.mod, look up v.mod projects under a directory (v_where), brief a repo, run only affected tests, run a compiled program, list compiler diagnostics as JSON, answer who-uses-what, and report its own build (v_server_info). PASS ABSOLUTE PATHS."
+		instructions: "V development server: compile, test (with a test-function glob only=… or a test-file filter files=…), format-check and format in place, vet, dump AST JSON, outline symbols, read one symbol's source (v_read), document a module, inspect v.mod, look up v.mod projects under a directory (v_where), brief a repo, run only affected tests, run a compiled program, list compiler diagnostics as JSON, answer who-uses-what, and report its own build (v_server_info). PASS ABSOLUTE PATHS."
 	)
 	server.add_tool(mcp.Tool{
 		name:         'v_build'
@@ -1286,7 +1363,7 @@ fn new_vlang_server() !mcp.Server {
 	}, v_build_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_run'
-		description:  'Compile path, then execute it. Optional args (JSON array of strings) are passed to the program; optional vflags (JSON array of strings) are forwarded to the compiler for the build. Returns the program output; compile failures return the compiler diagnostics as an error. Timeout and output caps apply.'
+		description:  'Compile path, then execute it. Optional args (JSON array of strings) are passed to the program; optional stdin (string) is piped to the program verbatim (no trailing newline added) and closed with EOF; optional vflags (JSON array of strings) are forwarded to the compiler for the build. Returns the program output; compile failures return the compiler diagnostics as an error. Timeout and output caps apply.'
 		input_schema: v_run_schema
 	}, v_run_tool)!
 	server.add_tool(mcp.Tool{
@@ -1296,7 +1373,7 @@ fn new_vlang_server() !mcp.Server {
 	}, v_errors_tool)!
 	server.add_tool(mcp.Tool{
 		name:         'v_test'
-		description:  'Run `v test` on a file or project (path). Optional only (string) is a VTEST_ONLY_FN glob forwarded via env(1) — run only test functions whose name matches, e.g. "*handshake*". Optional stats (boolean) returns structured rows [{file,name,ok,ms,asserts}] with the raw output as failure detail; unparsable runs fall back to the raw view.'
+		description:  'Run `v test` on a file or project (path). Optional only (string) is a VTEST_ONLY_FN glob forwarded via env(1) — run only test functions whose name matches, e.g. "*handshake*". Optional files (string) is a VTEST_ONLY file filter forwarded via env(1) — run only test files whose relative path contains one of the comma-separated patterns, e.g. "parse_test.v"; pairs with the v_affected output. Optional stats (boolean) returns structured rows [{file,name,ok,ms,asserts}] with the raw output as failure detail; unparsable runs fall back to the raw view.'
 		input_schema: v_test_schema
 	}, v_test_tool)!
 	server.add_tool(mcp.Tool{

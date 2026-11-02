@@ -259,6 +259,25 @@ fn test_v_run_and_v_errors_round_trips() {
 	sopt := res4.content.index('program stdout:') or { -1 }
 	sept := res4.content.index('program stderr:') or { -1 }
 	assert sopt < sept, res4.content
+
+	// stdin: a program that reads until EOF gets the payload and terminates
+	// only on EOF — so a green call here proves both piping and the EOF
+	stdin := os.join_path(os.temp_dir(), 'v_run_stdin_${os.getpid()}.v')
+	os.write_file(stdin, "import os\n\nfn main() {\n\tmut all := ''\n\tfor {\n\t\tline := os.get_raw_line()\n\t\tif line.len == 0 {\n\t\t\tbreak\n\t\t}\n\t\tall += line\n\t}\n\tprint(all)\n}\n")!
+	defer {
+		os.rm(stdin) or {}
+	}
+	res5 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_run'
+			arguments: {
+				'path':  json2.Any(stdin)
+				'stdin': json2.Any('ping\npong\n')
+			}
+		}) or { panic('tools/call v_run stdin: ${err.msg()}') }
+	assert !res5.is_error, res5.content
+	// content is JSON-wrapped: the newlines arrive escaped inside the cell
+	assert res5.content.contains('program stdout:\\nping\\npong'), res5.content
 }
 
 fn test_v_uses_call_round_trip() {
@@ -356,15 +375,31 @@ fn test_validate_vflags() {
 	assert rejected, 'empty flag must be rejected'
 }
 
-fn test_validate_only() {
-	validate_only('*parse_fn*') or { assert false, err.msg() }
-	validate_only('test_a1-[0-9]*') or { assert false, err.msg() }
+fn test_validate_filter() {
+	validate_filter('*parse_fn*') or { assert false, err.msg() }
+	validate_filter('test_a1-[0-9]*') or { assert false, err.msg() }
+	// file filters: path separators and the comma separator are legal
+	validate_filter('src/parse/parse_test.v') or { assert false, err.msg() }
+	validate_filter('parse_test.v,cache_test.v') or { assert false, err.msg() }
 	mut rejected := false
-	validate_only('a space') or { rejected = true }
+	validate_filter('a space') or { rejected = true }
 	assert rejected, 'spaces must be rejected'
 	rejected = false
-	validate_only('x;y') or { rejected = true }
+	validate_filter('x;y') or { rejected = true }
 	assert rejected, 'stray characters must be rejected'
+	rejected = false
+	validate_filter('a,b;c*d') or { rejected = true }
+	assert rejected, 'stray characters must be rejected in file filters too'
+}
+
+fn test_env_test_filter_prefix() {
+	// nothing asked: both inherited harness filters are cleared
+	assert env_test_filter_prefix('', '') == ['-u', 'VTEST_ONLY_FN', '-u', 'VTEST_ONLY']
+	// functions only: the file filter is still cleared, and -u entries come
+	// before the assignments (env(1) stops parsing options at the first one)
+	assert env_test_filter_prefix('*alpha*', '') == ['-u', 'VTEST_ONLY', 'VTEST_ONLY_FN=*alpha*']
+	// files only: function filter still cleared
+	assert env_test_filter_prefix('', 'a_test.v') == ['-u', 'VTEST_ONLY_FN', 'VTEST_ONLY=a_test.v']
 }
 
 fn test_symbol_source_slices_and_misses() {
@@ -471,10 +506,23 @@ fn test_v_where_v_read_and_argument_validation() {
 			}
 		}) or { panic('tools/call v_test bad only: ${err.msg()}') }
 	assert res4.is_error, res4.content
-	assert res4.content.contains('bad arguments: only:'), res4.content
+	assert res4.content.contains('bad arguments'), res4.content
+	assert res4.content.contains('unsupported character'), res4.content
+
+	// the same rejection guards files: bad file filters never reach env(1)
+	res5 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_test'
+			arguments: {
+				'path':  json2.Any(ws)
+				'files': json2.Any('a b')
+			}
+		}) or { panic('tools/call v_test bad files: ${err.msg()}') }
+	assert res5.is_error, res5.content
+	assert res5.content.contains('unsupported character'), res5.content
 
 	// v_read with a missing symbol lists what IS declared
-	res5 := client.request[CallToolParams, CallToolResult]('tools/call',
+	res6 := client.request[CallToolParams, CallToolResult]('tools/call',
 		CallToolParams{
 			name:      'v_read'
 			arguments: {
@@ -482,8 +530,36 @@ fn test_v_where_v_read_and_argument_validation() {
 				'symbol': json2.Any('no_such_symbol_here')
 			}
 		}) or { panic('tools/call v_read missing: ${err.msg()}') }
-	assert res5.is_error, res5.content
-	assert res5.content.contains('no symbol named'), res5.content
+	assert res6.is_error, res6.content
+	assert res6.content.contains('no symbol named'), res6.content
+
+	// v_errors on a compile failure with no parseable diagnostics: the
+	// summary explains and the captured text follows. v itself prints the
+	// option line twice (stderr, then its output echo) — the message keeps
+	// exactly those two
+	res7 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_errors'
+			arguments: {
+				'path':   json2.Any('${@VMODROOT}/main.v')
+				'vflags': json2.Any(['-this-flag-does-not-exist'])
+			}
+		}) or { panic('tools/call v_errors bad flag: ${err.msg()}') }
+	assert res7.is_error, res7.content
+	assert res7.content.contains('v_errors: command failed with exit code 1'), res7.content
+	n_opts := res7.content.count('unknown option')
+	assert n_opts == 2, 'compiler echo kept intact, got ${n_opts}: ${res7.content}'
+
+	// v_affected outside a git repository: a labeled failure, nothing more
+	res8 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_affected'
+			arguments: {
+				'path': json2.Any(ws)
+			}
+		}) or { panic('tools/call v_affected not a repo: ${err.msg()}') }
+	assert res8.is_error, res8.content
+	assert res8.content.contains('v_affected: git diff failed'), res8.content
 }
 
 fn test_parse_test_rows() {
@@ -518,14 +594,17 @@ fn test_v_test_stats_round_trip() {
 	}
 	client.initialize()!
 
-	// a two-test fixture: one passes, one fails
+	// a two-file, three-test fixture: probe_test.v (one passes, one fails),
+	// probe2_test.v (passes) — the same one v_affected would have listed
 	dir := os.join_path(os.temp_dir(), 'v_test_stats_${os.getpid()}')
 	os.rmdir_all(dir) or {}
 	os.mkdir(dir)!
 	os.write_file(os.join_path(dir, 'probe_test.v'), 'fn test_alpha_ok() {\n\tassert 1 + 1 == 2\n}\n\nfn test_beta_fail() {\n\tassert 1 + 1 == 3\n}\n')!
+	os.write_file(os.join_path(dir, 'probe2_test.v'), 'fn test_gamma_ok() {\n\tassert 1 + 1 == 2\n}\n')!
 	defer {
 		os.rmdir_all(dir) or {}
 	}
+	// both files are on: alpha+gamma pass, beta fails
 	res := client.request[CallToolParams, CallToolResult]('tools/call',
 		CallToolParams{
 			name:      'v_test'
@@ -535,7 +614,7 @@ fn test_v_test_stats_round_trip() {
 			}
 		}) or { panic('tools/call v_test: ${err.msg()}') }
 	assert !res.is_error, res.content
-	assert res.content.contains('tests: 1/2 passed'), res.content
+	assert res.content.contains('tests: 2/3 passed'), res.content
 	assert res.content.contains('test_alpha_ok'), res.content
 	assert res.content.contains('test_beta_fail'), res.content
 	assert res.content.contains('failure detail:'), res.content
@@ -554,6 +633,24 @@ fn test_v_test_stats_round_trip() {
 	assert res2.content.contains('tests: 1/1 passed'), res2.content
 	assert res2.content.contains('test_alpha_ok'), res2.content
 	assert !res2.content.contains('test_beta_fail'), res2.content
+
+	// stats + files: the unfiltered run above was 2/3; the file filter
+	// narrows the suite to probe2_test.v exactly like a v_affected-trimmed
+	// rerun
+	res3 := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_test'
+			arguments: {
+				'path':  json2.Any(dir)
+				'files': json2.Any('probe2_test.v')
+				'stats': json2.Any(true)
+			}
+		}) or { panic('tools/call v_test files: ${err.msg()}') }
+	assert !res3.is_error, res3.content
+	assert res3.content.contains('tests: 1/1 passed'), res3.content
+	assert res3.content.contains('test_gamma_ok'), res3.content
+	assert !res3.content.contains('test_beta_fail'), 'filtered file excluded: ${res3.content}'
+	assert !res3.content.contains('test_alpha_ok'), res3.content
 }
 
 fn test_build_cache_key_determinism_and_scope() {

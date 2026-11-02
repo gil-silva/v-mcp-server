@@ -155,6 +155,9 @@ Open your agent in any V project and just ask normal things:
 > *"Show me the failing spots as data."*
 > → `v_errors` — JSON rows with exact `file/line/col`, no prose to decode
 
+> *"Pipe this payload into my CLI and see what it prints."*
+> → `v_run` with `stdin` — piped verbatim, no trailing newline, EOF afterwards
+
 > *"Run my program with these two seeds and show me what it prints."*
 > → `v_run` — one call: compile, execute, labeled stdout/stderr
 
@@ -175,6 +178,9 @@ Open your agent in any V project and just ask normal things:
 
 > *"Re-run just `test_parse_fn`."*
 > → `v_test` with `only:"*parse_fn*"` — a `VTEST_ONLY_FN` glob narrows the suite to one function
+
+> *"Re-run just the files v_affected listed, not the whole directory."*
+> → `v_test` with `files:"parse_test.v,cache_test.v"` — a `VTEST_ONLY` filter narrows the suite by file
 
 > *"Who calls this function — and what implements this interface?"*
 > → `v_uses` — definitions, call sites with their enclosing fn, and
@@ -216,9 +222,9 @@ one-call patterns), so the savings show up in your context every session.
 | Tool          | Arguments | What it does |
 |---------------|-----------|--------------|
 | `v_build`     | `{path, vflags?}` | compiles and returns compiler diagnostics; optional `vflags` (JSON array of strings) is forwarded verbatim to the V CLI (e.g. `-g`, `-prod`, `-cc clang`, `-d flag`); warm-cached for identical inputs |
-| `v_run`       | `{path, args?, vflags?}` | compiles `path`, executes the binary (or the cached one); optional `args` (JSON array of strings) become the program's argv, optional `vflags` are forwarded to the compiler, output returned with stdout/stderr labeled |
+| `v_run`       | `{path, args?, stdin?, vflags?}` | compiles `path`, executes the binary (or the cached one); optional `args` (JSON array of strings) become the program's argv, optional `stdin` (string) is piped to the program verbatim (no trailing newline added, EOF afterwards), optional `vflags` are forwarded to the compiler, output returned with stdout/stderr labeled |
 | `v_errors`    | `{path, vflags?}`  | compile-only; diagnostics as JSON `[{file,line,col,kind,message}]` — `[]` means clean; optional `vflags` mirror the `v_build` command |
-| `v_test`      | `{path, only?, stats?}` | runs `v test`; optional `only` is a test-function glob forwarded as `VTEST_ONLY_FN` (via `env(1)`); optional `stats` returns structured rows `[{file,name,ok,ms,asserts}]` with the raw output trailing as failure detail |
+| `v_test`      | `{path, only?, files?, stats?}` | runs `v test`; optional `only` is a test-function glob forwarded as `VTEST_ONLY_FN` (via `env(1)`); optional `files` is a test-file filter forwarded as `VTEST_ONLY` — comma-separated patterns matched as substrings of each test file's path relative to `path`, pairing with the `v_affected` output; optional `stats` returns structured rows `[{file,name,ok,ms,asserts}]` with the raw output trailing as failure detail |
 | `v_fmt_check` | `{path}`  | `v fmt -c` — check only, never touches files |
 | `v_fmt`       | `{path}`  | `v fmt -w` — format in place (mutates files) |
 | `v_vet`       | `{path}`  | `v vet` warnings |
