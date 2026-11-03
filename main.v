@@ -871,7 +871,14 @@ fn v_run_tool(_ctx mcp.Context, arguments string) !mcp.ToolResult {
 	seconds := resolve_timeout(a.timeout) or {
 		return to_error_result('bad arguments: ${err.msg()}')
 	}
-	outcome := build_with_cache(a.path, flags, seconds)
+	// The compile spawn is infrastructure and keeps the server-wide cap —
+	// v_scratch's compile already runs under exactly that fixed budget. The
+	// `timeout` override answers "how long may the program run": feeding it
+	// to the compile let a small cap kill the build before the program ever
+	// ran (CI run 27 replayed this: a 2 s override, a pid-unique scratch
+	// target and a partially warm cache made the build exceed 2 s and the
+	// reply read "v_run build failed:\ncommand timed out after 2 s").
+	outcome := build_with_cache(a.path, flags, tool_timeout_seconds)
 	if !outcome.ok {
 		build_log := if outcome.text.len == 0 { outcome.summary } else { outcome.text }
 		return to_error_result('v_run build failed:\n${build_log}')
