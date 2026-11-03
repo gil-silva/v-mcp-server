@@ -501,8 +501,10 @@ fn toolchain_stamp() string {
 
 // build_cache_key hashes the full build identity: toolchain stamp, realpath
 // and vflags of the request, plus content hashes of the .v sources in scope
-// (the whole tree under a directory target; a single file target by itself)
-// and the v.mod beside them (it names the dependencies). Content hashes, not
+// (the whole tree under a directory target; a plain file target by itself;
+// a *_test.v target together with the .v siblings of its directory, which V
+// pulls into the compile beside the test) and the v.mod beside them (it
+// names the dependencies). Content hashes, not
 // mtimes, decide hits: a touched-but-unchanged tree can hit, a rewritten
 // same-size file cannot. Unreadable pieces are skipped rather than invented;
 // an empty key — unreadable target, or a path that is neither a .v file nor
@@ -519,6 +521,9 @@ fn build_cache_key(path string, flags []string) string {
 	} else if path.ends_with('.v') {
 		src := os.read_file(path) or { return '' }
 		manifest << '${os.file_name(path)}\x1f${sha256.sum(src.bytes()).hex()[..16]}'
+		if os.file_name(path).ends_with('_test.v') {
+			collect_sibling_rows(path, mut manifest)
+		}
 	} else {
 		return ''
 	}
@@ -557,6 +562,30 @@ fn collect_source_rows(dir string, prefix string, mut rows []string) {
 // join_rel builds a `src/main.v` relative name from a walker prefix and entry.
 fn join_rel(prefix string, entry string) string {
 	return if prefix == '' { entry } else { '${prefix}/${entry}' }
+}
+
+// collect_sibling_rows hashes the other .v files beside a `_test.v` target.
+// V's compile unit for a test file reaches past the file itself: the module
+// siblings of its directory are pulled in beside it (probed both ways — `v
+// test lib_test.v` reports a sibling's syntax error that `v lib.v` alone
+// compiles through). A key missing them replayed stale records, which is
+// what made v_errors answer `[]` for test files in a broken module and
+// replay failure rows after the sibling was fixed; hashing the directory's
+// .v content puts the true compile unit in the identity. Plain file targets
+// compile on their own, so only test targets pay this key input.
+fn collect_sibling_rows(path string, mut rows []string) {
+	dir := os.dir(path)
+	file_name := os.file_name(path)
+	sibs := os.ls(dir) or { return }
+	mut names := sibs.filter(it.ends_with('.v') && it != file_name)
+	names.sort()
+	for name in names {
+		src := os.read_file(os.join_path(dir, name)) or {
+			rows << '${name}\x1funreadable'
+			continue
+		}
+		rows << '${name}\x1f${sha256.sum(src.bytes()).hex()[..16]}'
+	}
 }
 
 // cache_load returns the stored record for key, or none when absent/bad.

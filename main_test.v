@@ -225,6 +225,112 @@ fn test_diagnostics_body_limit_shapes() {
 	assert body.contains('"truncated":true'), body
 }
 
+// decode_diags_or_panic decodes a plain []Diagnostic tool body, naming the
+// body when the shape does not fit.
+fn decode_diags_or_panic(content string) []Diagnostic {
+	return json2.decode[[]Diagnostic](content) or {
+		panic('decode diagnostics: ${err.msg()}: ${content}')
+	}
+}
+
+// tool_text strips the first text item out of an MCP tool-result content
+// array (the harness captures the raw `content` field, whose array wrapper
+// is not the server's inner text).
+fn tool_text(content string) string {
+	items := json2.decode[[]json2.Any](content) or { return content }
+	first := items[0]
+	text := first.as_map()['text'] or { return content }
+	return text.str()
+}
+
+// the cache identity of a *_test.v target moves with its module siblings:
+// `v` pulls them into the compile beside the test, so a key on the test
+// file alone replayed stale records (v_errors answered [] on a broken
+// module and replayed failures after the sibling was fixed). A plain file
+// target keeps keying by itself — it compiles alone.
+fn test_build_cache_key_moves_with_test_module_siblings() {
+	dir := os.join_path(os.temp_dir(), 'vmsd_key_${os.getpid()}')
+	os.mkdir_all(dir)!
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	os.write_file(os.join_path(dir, 'v.mod'),
+		"Module { name: 'sibs' description: 'probe' version: '0.1.0' license: 'MIT' dependencies: [] }")!
+	os.write_file(os.join_path(dir, 'lib.v'), 'module sibs\n\nfn sib() int {\n\treturn 1\n}\n')!
+	os.write_file(os.join_path(dir, 'lib_test.v'), 'module sibs\n\nfn test_sib() {\n\tassert sib() == 1\n}\n')!
+	before := build_cache_key(os.join_path(dir, 'lib_test.v'), [])
+	assert before != '', before
+	os.write_file(os.join_path(dir, 'lib.v'), 'module sibs\n\nfn sib() int {\n\treturn 2\n}\n')!
+	after := build_cache_key(os.join_path(dir, 'lib_test.v'), [])
+	assert before != after, '${before} vs ${after}'
+	// the plain neighbor keys by itself: lib_test.v edits stay out of its key
+	plain_before := build_cache_key(os.join_path(dir, 'lib.v'), [])
+	os.write_file(os.join_path(dir, 'lib_test.v'), 'module sibs\n\nfn test_sib() {\n\tassert sib() == 3\n}\n')!
+	plain_after := build_cache_key(os.join_path(dir, 'lib.v'), [])
+	assert plain_before == plain_after, '${plain_before} vs ${plain_after}'
+}
+
+// v_errors on a test file tracks the module state rather than the last
+// record's truth: a broken sibling surfaces, a fixed sibling clears.
+fn test_v_errors_tracks_module_state_on_test_files() {
+	bin := compile_server()
+	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
+		panic('connect_stdio: ${err.msg()}')
+	}
+	defer {
+		client.close()
+	}
+	client.initialize()!
+
+	dir := os.join_path(os.temp_dir(), 'vmsd_state_${os.getpid()}')
+	os.mkdir_all(dir)!
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	os.write_file(os.join_path(dir, 'v.mod'),
+		"Module { name: 'sibstate' description: 'probe' version: '0.1.0' license: 'MIT' dependencies: [] }")!
+	good := 'module sibstate\n\nfn sib() int {\n\treturn 1\n}\n'
+	bad := 'module sibstate\n\nfn sib() int {\n\treturn \n}\n'
+	lib := os.join_path(dir, 'lib.v')
+	test_target := os.join_path(dir, 'lib_test.v')
+	os.write_file(lib, good)!
+	os.write_file(test_target, 'module sibstate\n\nfn test_sib() {\n\tassert sib() == 1\n}\n')!
+
+	clean := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_errors'
+			arguments: {
+				'path': json2.Any(test_target)
+			}
+		}) or { panic('tools/call v_errors clean: ${err.msg()}') }
+	assert !clean.is_error, clean.content
+	assert decode_diags_or_panic(tool_text(clean.content)).len == 0, tool_text(clean.content)
+
+	os.write_file(lib, bad)!
+	broken := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_errors'
+			arguments: {
+				'path': json2.Any(test_target)
+			}
+		}) or { panic('tools/call v_errors broken: ${err.msg()}') }
+	assert !broken.is_error, broken.content
+	rows := decode_diags_or_panic(tool_text(broken.content))
+	assert rows.len > 0, tool_text(broken.content)
+	assert rows.any(it.file.contains('lib.v')), tool_text(broken.content)
+
+	os.write_file(lib, good)!
+	fixed := client.request[CallToolParams, CallToolResult]('tools/call',
+		CallToolParams{
+			name:      'v_errors'
+			arguments: {
+				'path': json2.Any(test_target)
+			}
+		}) or { panic('tools/call v_errors fixed: ${err.msg()}') }
+	assert !fixed.is_error, fixed.content
+	assert decode_diags_or_panic(tool_text(fixed.content)).len == 0, tool_text(fixed.content)
+}
+
 fn test_v_run_and_v_errors_round_trips() {
 	bin := compile_server()
 	mut client := mcp.connect_stdio(bin, [], mcp.ClientConfig{}) or {
