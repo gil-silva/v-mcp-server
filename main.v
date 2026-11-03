@@ -318,16 +318,31 @@ struct Capture {
 // v_affected's git probe, v_server_info and the toolchain stamp — each
 // formats the Capture its own way.
 fn run_capture(args []string, seconds int) Capture {
-	// Every child rides through sh(1) with exec: "$@" keeps every argument
-	// byte-verbatim (nothing user-supplied is parsed by the shell), and
-	// `< /dev/null` gives the child an empty stdin instead of redirect-stdio's
-	// never-written, never-closed pipe — on which children that read stdin
-	// (vfmt on an input dir with no .v files, a v_run program reading its
-	// stdin with none piped) block until the timeout cap kills them.
+	return capture_sh_line('exec "$@" < /dev/null', args, seconds)
+}
+
+// compile_capture is run_capture for compile invocations: it exports a
+// fresh V3CACHE root to each compile so the driver always builds cold. The
+// current toolchain mishandles a resumed prepared-module preamble on
+// directory-target rebuilds (a second identical compile reports a duplicate
+// seeded closure-runtime import and cascades bogus cached-header errors), so
+// replays must not resume: a cold build is the one reliable compile route.
+fn compile_capture(args []string, seconds int) Capture {
+	return capture_sh_line('V3CACHE=${compile_v3cache_root()}; export V3CACHE; exec "$@" < /dev/null',
+		args, seconds)
+}
+
+// capture_sh_line is the sh(1) runner under which every spawn here executes:
+// `exec` keeps every argument byte-verbatim (nothing user-supplied is parsed
+// by the shell), and `< /dev/null` gives the child an empty stdin instead of
+// redirect-stdio's never-written, never-closed pipe — on which children that
+// read stdin (vfmt on an input dir with no .v files, a v_run program reading
+// its stdin with none piped) block until the timeout cap kills them.
+fn capture_sh_line(line string, args []string, seconds int) Capture {
 	mut cmd := []string{cap: args.len + 4}
 	cmd << 'sh'
 	cmd << '-c'
-	cmd << 'exec "$@" < /dev/null'
+	cmd << line
 	cmd << 'v-mcp-server-capture'
 	cmd << args
 	mut p := os.new_process(cmd[0])
@@ -420,6 +435,34 @@ fn truncate(text string) string {
 fn tmp_output_path(tag string) string {
 	return os.join_path(os.temp_dir(),
 		'mcp_vlang_${tag}_${os.getpid()}_${time.now().unix().str()}_random_1')
+}
+
+// compile_v3cache_root creates a fresh per-compile V3CACHE root under the
+// system temp dir, so every compile rebuilds cold; roots older than an hour
+// (their run_ stamp carries the unix second) are dropped opportunistically.
+fn compile_v3cache_root() string {
+	base := os.join_path(os.temp_dir(), 'mcp_vlang_v3cache')
+	os.mkdir_all(base) or {}
+	for entry in os.ls(base) or { []string{} } {
+		stamp := entry.all_after('run_').all_before('_')
+		mut all_digits := stamp.len > 0
+		for i in 0 .. stamp.len {
+			c := stamp[i]
+			if c < 48 || c > 57 {
+				all_digits = false
+				break
+			}
+		}
+		if all_digits {
+			born := stamp.int()
+			if born > 0 && time.now().unix() - born > 3600 {
+				os.rmdir_all(os.join_path(base, entry)) or {}
+			}
+		}
+	}
+	root := os.join_path(base, 'run_${time.now().unix()}_${os.getpid()}_${time.sys_mono_now()}')
+	os.mkdir_all(root) or {}
+	return root
 }
 
 // compile_args assembles the v compile invocation shared by v_build, v_run
@@ -677,7 +720,7 @@ fn build_with_cache(path string, flags []string, seconds int) BuildOutcome {
 // compile succeeded.
 fn compile_and_store(path string, flags []string, key string, seconds int) BuildOutcome {
 	tmp := tmp_output_path('cache_target')
-	compile := run_capture(compile_args(tmp, path, flags), seconds)
+	compile := compile_capture(compile_args(tmp, path, flags), seconds)
 	ok := compile.exit_code == 0 && !compile.timed_out
 	text := merge_streams(compile.stdout, compile.stderr)
 	summary := if compile.timed_out {
